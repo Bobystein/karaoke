@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Karaoke · pantalla</title>
+  {# Sin CDN a proposito: la pantalla tiene que funcionar aunque se caiga el internet. #}
+  <style>
+    :root {
+      --bg: #07060b;
+      --fg: #f5f3ff;
+      --muted: #a39fb8;
+      --accent: #d946ef;
+      --accent2: #8b5cf6;
+      --ok: #34d399;
+      --info: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      cursor: none;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .capa {
+      position: fixed; inset: 0;
+      transition: opacity .8s ease;
+    }
+    .oculta { opacity: 0; pointer-events: none; }
+
+    /* --- modo espera --- */
+    #espera {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 4vh;
+      background:
+        radial-gradient(ellipse at 20% 10%, rgba(217, 70, 239, .28), transparent 55%),
+        radial-gradient(ellipse at 85% 90%, rgba(139, 92, 246, .30), transparent 55%),
+        var(--bg);
+      padding: 4vh 4vw;
+      text-align: center;
+    }
+    #espera h1 {
+      font-size: clamp(3rem, 11vh, 9rem);
+      font-weight: 900;
+      letter-spacing: -.03em;
+      line-height: 1;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .qrs { display: flex; gap: 7vw; align-items: flex-start; justify-content: center; }
+    .qr { display: flex; flex-direction: column; align-items: center; gap: 1.6vh; }
+    .qr .caja {
+      width: min(34vh, 30vw); aspect-ratio: 1;
+      background: #fff; border-radius: 2.2vh; padding: 1.2vh;
+      box-shadow: 0 2vh 6vh rgba(0, 0, 0, .5);
+    }
+    .qr .caja svg { width: 100%; height: 100%; display: block; }
+    .qr .caja.vacia {
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(255, 255, 255, .06); color: var(--muted); font-size: 2.2vh; padding: 3vh;
+    }
+    .qr .paso { font-size: 3.4vh; font-weight: 800; }
+    .qr .detalle { font-size: 2.4vh; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .instrucciones { font-size: 3vh; color: var(--muted); line-height: 1.5; }
+    .instrucciones strong { color: var(--fg); }
+
+    #descargando { font-size: 2.8vh; color: var(--muted); min-height: 3vh; }
+    #descargando .titulo { color: var(--info); font-weight: 700; margin-bottom: .8vh; }
+    #descargando ul { list-style: none; display: flex; flex-direction: column; gap: .6vh; }
+    #descargando .pct { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+    /* --- modo reproduccion --- */
+    #reproduccion { background: #000; }
+    #video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+
+    #barra {
+      position: absolute; top: 0; left: 0; right: 0;
+      display: flex; align-items: stretch; gap: 3vw;
+      padding: 2.2vh 3vw 3.2vh;
+      background: linear-gradient(180deg, rgba(7, 6, 11, .94) 0%, rgba(7, 6, 11, .82) 75%, rgba(7, 6, 11, 0) 100%);
+      transform: translateY(-110%);
+      transition: transform .7s cubic-bezier(.2, .8, .2, 1);
+    }
+    #barra.visible { transform: translateY(0); }
+    #barra .ahora { flex: 1.6; min-width: 0; }
+    #barra .etiqueta { font-size: 1.7vh; text-transform: uppercase; letter-spacing: .2em; color: var(--accent); font-weight: 800; }
+    #barra .cancion { font-size: 3.6vh; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #barra .quien { font-size: 2.4vh; color: var(--muted); }
+    #barra .siguientes { flex: 1; min-width: 0; border-left: 2px solid rgba(255, 255, 255, .12); padding-left: 2.5vw; }
+    #barra .siguientes .etiqueta { color: var(--muted); }
+    #barra ol { list-style: none; margin-top: .6vh; display: flex; flex-direction: column; gap: .5vh; }
+    #barra li { font-size: 2.3vh; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #barra li .quien { font-size: 2.1vh; }
+    #barra li .estado { font-size: 1.8vh; color: var(--info); }
+
+    #aviso {
+      position: absolute; inset: auto 0 9vh 0;
+      display: flex; justify-content: center;
+      transition: opacity .5s ease, transform .5s ease;
+    }
+    #aviso.oculta { transform: translateY(3vh); }
+    #aviso .tarjeta {
+      max-width: 80vw;
+      background: linear-gradient(90deg, rgba(217, 70, 239, .92), rgba(139, 92, 246, .92));
+      border-radius: 3vh; padding: 2.6vh 5vw; text-align: center;
+      box-shadow: 0 2vh 8vh rgba(0, 0, 0, .6);
+    }
+    #aviso .etiqueta { font-size: 2.4vh; text-transform: uppercase; letter-spacing: .25em; font-weight: 700; opacity: .85; }
+    #aviso .nombre { font-size: 7vh; font-weight: 900; line-height: 1.1; }
+    #aviso .cancion { font-size: 3vh; opacity: .9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    #pausa {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(0, 0, 0, .45); font-size: 8vh; font-weight: 900; letter-spacing: .1em;
+    }
+
+    #bloqueado {
+      position: fixed; inset: auto 2vw 2vh auto; max-width: 40vw;
+      background: #7f1d1d; color: #fff; border-radius: 1.5vh; padding: 1.5vh 2vw; font-size: 2vh;
+      cursor: pointer;
+    }
+    #conexion {
+      position: fixed; right: 1.2vw; bottom: 1.2vh; width: 1.2vh; height: 1.2vh; border-radius: 50%;
+      background: #ef4444; transition: opacity .5s;
+    }
+    #conexion.ok { opacity: 0; }
+  </style>
+</head>
+<body>
+
+<section id="espera" class="capa">
+  <h1>Karaoke</h1>
+
+  <div class="qrs">
+    <div class="qr">
+      {% if wifi_qr %}
+      <div class="caja">{{ wifi_qr | safe }}</div>
+      {% else %}
+      <div class="caja vacia">Falta configurar KARAOKE_WIFI_SSID</div>
+      {% endif %}
+      <div class="paso">1 · Conéctate al WiFi</div>
+      <div class="detalle">{{ wifi_ssid }}</div>
+    </div>
+    <div class="qr">
+      <div class="caja">{{ app_qr | safe }}</div>
+      <div class="paso">2 · Abre el karaoke</div>
+      <div class="detalle">{{ app_url }}</div>
+    </div>
+  </div>
+
+  <p class="instrucciones">
+    Escanea el primero con la cámara para unirte al WiFi y el segundo para abrir la app.<br>
+    <strong>Busca tu canción, agrégala a la cola</strong> y espera tu turno.
+  </p>
+
+  <div id="descargando"></div>
+</section>
+
+<section id="reproduccion" class="capa oculta">
+  <video id="video" playsinline preload="auto" disablepictureinpicture></video>
+
+  <header id="barra">
+    <div class="ahora">
+      <div class="etiqueta">Ahora</div>
+      <div class="cancion" id="barra-titulo"></div>
+      <div class="quien" id="barra-quien"></div>
+    </div>
+    <div class="siguientes">
+      <div class="etiqueta">Siguen</div>
+      <ol id="barra-siguientes"></ol>
+    </div>
+  </header>
+
+  <div id="aviso" class="oculta">
+    <div class="tarjeta">
+      <div class="etiqueta">Sigue</div>
+      <div class="nombre" id="aviso-nombre"></div>
+      <div class="cancion" id="aviso-cancion"></div>
+    </div>
+  </div>
+
+  <div id="pausa" class="oculta">EN PAUSA</div>
+</section>
+
+<div id="bloqueado" class="oculta">El navegador bloqueó el audio. Lanza Chromium con --autoplay-policy=no-user-gesture-required (ver README) o toca aquí.</div>
+<div id="conexion"></div>
+
+<script src="/static/ws.js"></script>
+<script src="/static/pantalla.js"></script>
+</body>
+</html>
