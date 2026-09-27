@@ -1,102 +1,102 @@
-# SPEC: Sistema de karaoke para coatl
+# SPEC: Karaoke system for coatl
 
-Karaoke casero. La pantalla (monitor o tele por HDMI) reproduce el video con la
-letra; los invitados buscan y encolan canciones desde su celular por el WiFi de
-la casa.
+Home karaoke. The screen (monitor or TV over HDMI) plays the video with the
+lyrics; guests search and queue songs from their phones over the home WiFi.
 
 ---
 
-## 1. Decision de arquitectura
+## 1. Architecture decision
 
-La pantalla NO es un reproductor aparte controlado por IPC. Es **una pagina web
-mas de esta misma app**, abierta en Chromium en modo kiosko a pantalla completa.
+The screen is NOT a separate player controlled over IPC. It is **just another
+web page of this same app**, opened in Chromium in full-screen kiosk mode.
 
-El motivo: los requisitos de la pantalla (barra deslizante con las siguientes
-dos canciones, pantalla de espera con codigos QR, transiciones entre canciones)
-son trivialmente HTML y CSS, y serian dolorosos de dibujar encima de mpv. Con
-esta decision hay un solo codigo, un solo estado en el servidor, y la pantalla
-es un cliente igual que los celulares, solo que con otra vista.
+The reason: the screen's requirements (a sliding bar with the next two songs,
+a waiting screen with QR codes, transitions between songs) are trivial in HTML
+and CSS, and would be painful to draw on top of mpv. With this decision there
+is a single codebase, a single state on the server, and the screen is a client
+just like the phones, only with a different view.
 
-El video se descarga con `yt-dlp` a disco local, el servidor lo sirve como
-archivo estatico, y la pagina lo reproduce en una etiqueta `<video>`.
+The video is downloaded with `yt-dlp` to local disk, the server serves it as a
+static file, and the page plays it in a `<video>` tag.
 
 ```
-navegador en kiosko (pantalla)  ─┐
-celulares de los invitados      ─┼─ WebSocket ─→ FastAPI ─→ SQLite
-celular del admin               ─┘                   │
-                                                     └─→ yt-dlp → media/
+kiosk browser (screen)   ─┐
+guests' phones           ─┼─ WebSocket ─→ FastAPI ─→ SQLite
+admin's phone            ─┘                   │
+                                              └─→ yt-dlp → media/
 ```
 
-Corre en `/home/rober/karaoke`, puerto 8004, abierto al WiFi local (no solo
+Runs in `/home/rober/karaoke`, port 8004, open to the local WiFi (not only
 Tailscale).
 
 ---
 
-## 2. Stack fijo
+## 2. Fixed stack
 
-Python 3.14, FastAPI, Uvicorn, Jinja2, HTMX y Tailwind por CDN, `websockets`
-(via FastAPI), SQLite estandar, `yt-dlp`, `segno` (para los QR, es Python puro
-y escribe SVG). pytest para tests. Sin ORM, sin Node, sin build step.
+Python 3.14, FastAPI, Uvicorn, Jinja2, HTMX and Tailwind from a CDN,
+`websockets` (via FastAPI), standard SQLite, `yt-dlp`, `segno` (for the QR
+codes; it's pure Python and writes SVG). pytest for tests. No ORM, no Node, no
+build step.
 
 ---
 
-## 3. Estructura
+## 3. Structure
 
 ```
 ~/karaoke/
 ├── app/
-│   ├── main.py          # rutas HTTP y WebSocket
-│   ├── queue.py         # estado de la cola, la maquina de estados
-│   ├── downloader.py    # envoltura de yt-dlp, busqueda y descarga
+│   ├── main.py          # HTTP and WebSocket routes
+│   ├── queue.py         # queue state, the state machine
+│   ├── downloader.py    # yt-dlp wrapper, search and download
 │   ├── db.py
 │   ├── templates/
 │   │   ├── base.html
-│   │   ├── pantalla.html    # la vista de la tele
-│   │   ├── movil.html       # la vista del celular
+│   │   ├── screen.html      # the TV view
+│   │   ├── mobile.html      # the phone view
 │   │   └── partials/
 │   └── static/
-├── media/               # videos descargados (cache, fuera de git)
+├── media/               # downloaded videos by default (KARAOKE_MEDIA_DIR; cache, outside git)
 ├── data/karaoke.db
 ├── schema.sql
-├── deploy/              # unit de systemd, regla de ufw
+├── deploy/              # systemd unit, ufw rule, kiosk script
 ├── requirements.txt
 └── SPEC.md
 ```
 
 ---
 
-## 4. Base de datos
+## 4. Database
 
 ```sql
--- Quien esta en la fiesta. Sin contrasena, solo un nombre.
+-- Who's at the party. No password, just a name.
 CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,        -- uuid4, va en cookie
+    id          TEXT PRIMARY KEY,        -- uuid4, stored in a cookie
     name        TEXT NOT NULL,
     is_admin    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Cache de videos ya descargados. La clave es el id de YouTube.
+-- Cache of downloaded videos. The key is the YouTube id.
 CREATE TABLE IF NOT EXISTS songs (
     video_id     TEXT PRIMARY KEY,
     title        TEXT NOT NULL,
     channel      TEXT,
     duration_s   INTEGER,
-    file_path    TEXT,                   -- NULL mientras no se ha descargado
+    file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
     downloaded_at TEXT,
     play_count   INTEGER NOT NULL DEFAULT 0
 );
 
--- La cola. Un renglon por peticion, aunque la cancion se repita.
+-- The queue. One row per request, even if the song repeats.
 CREATE TABLE IF NOT EXISTS queue (
     id            INTEGER PRIMARY KEY,
     video_id      TEXT NOT NULL REFERENCES songs(video_id),
     session_id    TEXT REFERENCES sessions(id),
-    requested_by  TEXT NOT NULL,          -- copia del nombre, por si se borra la sesion
-    state         TEXT NOT NULL           -- ver maquina de estados abajo
+    requested_by  TEXT NOT NULL,          -- copy of the name, in case the session is deleted
+    state         TEXT NOT NULL           -- see the state machine below
                   CHECK (state IN ('queued','downloading','ready','playing','played','failed','removed')),
-    position      INTEGER NOT NULL,       -- orden en la cola, editable por el admin
+    position      INTEGER NOT NULL,       -- order in the queue, editable by the admin
     error         TEXT,
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
@@ -105,12 +105,12 @@ CREATE TABLE IF NOT EXISTS queue (
 CREATE INDEX IF NOT EXISTS idx_queue_state ON queue(state, position);
 ```
 
-`requested_by` se guarda duplicado a proposito: el nombre que aparece en
-pantalla no debe depender de que la sesion siga viva.
+`requested_by` is duplicated on purpose: the name shown on screen must not
+depend on the session still being alive.
 
 ---
 
-## 5. Maquina de estados de la cola
+## 5. Queue state machine
 
 ```
 queued ──→ downloading ──→ ready ──→ playing ──→ played
@@ -118,142 +118,149 @@ queued ──→ downloading ──→ ready ──→ playing ──→ played
               └──→ failed
 ```
 
-- **queued**: recien agregada. Si la cancion ya esta en cache (`songs.file_path`
-  no es NULL y el archivo existe), pasa directo a `ready` sin descargar.
-- **downloading**: `yt-dlp` trabajando en segundo plano. La UI muestra progreso.
-- **ready**: archivo en disco, lista para sonar.
-- **playing**: solo puede haber UNA en este estado a la vez. Invariante que los
-  tests deben verificar.
-- **played**: termino. Se queda en la tabla para el historial.
-- **failed**: la descarga fallo. Guarda el motivo en `error`, se muestra al que
-  la pidio, y la cola sigue con la siguiente.
-- **removed**: la quito el admin o quien la pidio. No se borra el renglon.
+- **queued**: just added. If the song is already cached (`songs.file_path` is
+  not NULL and the file exists), it goes straight to `ready` without
+  downloading.
+- **downloading**: `yt-dlp` working in the background. The UI shows progress.
+- **ready**: file on disk, ready to play.
+- **playing**: only ONE can be in this state at a time. An invariant the tests
+  must check.
+- **played**: finished. Stays in the table as history.
+- **failed**: the download failed. The reason is stored in `error`, shown to
+  whoever requested it, and the queue moves on to the next one.
+- **removed**: removed by the admin or by whoever requested it. The row is not
+  deleted.
 
-El servidor descarga **con anticipacion**: mientras suena una cancion, ya esta
-bajando las siguientes dos. Asi nunca hay espera entre canciones. Maximo dos
-descargas simultaneas para no saturar la red.
+The server downloads **ahead of time**: while a song plays, it's already
+downloading the next two. That way there's never a wait between songs. At most
+two simultaneous downloads so the network isn't saturated.
 
-**Regla de avance**: cuando la cancion actual termina, se busca la primera en
-`ready` por `position`. Si la siguiente todavia esta en `downloading`, se salta
-a la que si este lista y la que faltaba conserva su lugar para cuando baje. Si
-no hay ninguna lista, la pantalla vuelve al modo espera.
+**Advance rule**: when the current song ends, look for the first `ready` one by
+`position`. If the next one is still `downloading`, skip to the one that is
+ready; the missing one keeps its spot for when it finishes. If none is ready,
+the screen goes back to waiting mode.
 
 ---
 
-## 6. Busqueda y descarga
+## 6. Search and download
 
-`downloader.py` envuelve `yt-dlp` como libreria de Python, no por subproceso.
+`downloader.py` wraps `yt-dlp` as a Python library, not as a subprocess.
 
-### Busqueda
+### Search
 
-`ytsearch12:<consulta> karaoke` con `extract_flat=True` para que sea rapido (no
-resuelve cada video, solo lista). La palabra "karaoke" se agrega
-automaticamente a la consulta, con una casilla en la UI para no agregarla.
+`ytsearch12:<query> karaoke` with `extract_flat=True` so it's fast (it doesn't
+resolve each video, it only lists them). The word "karaoke" is added to the
+query automatically, with a checkbox in the UI to leave it out.
 
-Devuelve id, titulo, canal, duracion y miniatura. Filtrar resultados de mas de
-15 minutos (suelen ser recopilaciones, no canciones).
+Returns id, title, channel, duration and thumbnail. Filter out results longer
+than 15 minutes (usually compilations, not songs).
 
-### Descarga
+### Download
 
-Formato: preferir mp4 con H.264 y audio AAC, que es lo que el navegador
-reproduce nativamente y la UHD 620 decodifica por hardware. Algo como
+Format: prefer mp4 with H.264 and AAC audio, which is what the browser plays
+natively and the UHD 620 decodes in hardware. Something like
 `bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=1080][ext=mp4]`.
-Si lo que baja no es reproducible en navegador, es un fallo real: reportar
-`failed`, no dejarlo callado.
+If what comes down isn't playable in the browser, that's a real failure:
+report `failed`, don't swallow it.
 
-Guardar en `media/<video_id>.mp4`. Antes de descargar, verificar si ya existe.
+Save to `<KARAOKE_MEDIA_DIR>/<video_id>.mp4`. Before downloading, check whether it already
+exists.
 
-**El cache es la funcion mas valiosa del sistema**: despues de un par de
-fiestas ya hay biblioteca propia, las canciones repetidas arrancan al instante y
-deja de depender de internet. Nunca borrar automaticamente.
+**The cache is the most valuable feature of the system**: after a couple of
+parties there's a library of our own, repeated songs start instantly and it
+stops depending on the internet. Never delete automatically.
 
-### Seguridad
+### Security
 
-La consulta del usuario NUNCA se interpola en una linea de comando. yt-dlp se
-usa como libreria con la consulta como parametro. Esto importa porque la app
-esta abierta al WiFi de la casa y recibe texto de gente cualquiera.
-
----
-
-## 7. La pantalla (`/pantalla`)
-
-Pantalla completa, fondo oscuro, pensada para verse de lejos. Se conecta por
-WebSocket y reacciona a lo que le mande el servidor.
-
-### Modo espera
-
-Cuando no hay nada sonando:
-
-- Titulo grande: "Karaoke".
-- **Dos codigos QR lado a lado**, generados con `segno` como SVG:
-  - Izquierda: conectarse al WiFi. Usa el formato estandar
-    `WIFI:T:WPA;S:<ssid>;P:<password>;;`, que Android e iOS reconocen para unirse
-    con un escaneo. SSID y contrasena salen de variables de entorno, nunca del
-    codigo.
-  - Derecha: abrir la app, `http://<ip_lan>:8004`. La IP se detecta sola al
-    arrancar, no se escribe a mano.
-- Debajo, instrucciones de dos renglones.
-- Si hay canciones en cola pero ninguna lista todavia, mostrar "descargando..."
-  con cuales vienen.
-
-### Modo reproduccion
-
-- El video ocupa toda la pantalla, sin controles nativos.
-- **Barra superior deslizante** que aparece y se oculta sola: muestra lo que
-  suena (titulo y quien la pidio) y las siguientes DOS de la cola. Visible los
-  primeros 10 segundos de cada cancion, luego se desliza hacia arriba, y vuelve
-  a aparecer en los ultimos 15 segundos. Tambien aparece si la cola cambia.
-- Tres segundos antes de terminar, aviso grande de quien sigue.
-- Nada mas en pantalla. La cola completa se ve en el celular, no aqui.
-
-### Detalles tecnicos que hay que resolver
-
-- **Autoplay**: los navegadores bloquean reproduccion automatica con sonido.
-  Chromium en kiosko necesita `--autoplay-policy=no-user-gesture-required`. Va
-  en el script de arranque, documentado en el README.
-- **Protector de pantalla**: apagarlo con `xset s off -dpms` antes de lanzar el
-  kiosko, o a mitad de la fiesta se pone negro.
-- **Fin de cancion**: el evento `ended` del `<video>` avisa al servidor por
-  WebSocket, y el servidor decide que sigue. La pantalla nunca decide sola:
-  el estado vive en el servidor.
-- **Reconexion**: si se cae el WebSocket, reintentar cada 2 segundos sin
-  recargar la pagina, para no interrumpir el video.
+The user's query is NEVER interpolated into a command line. yt-dlp is used as
+a library with the query as a parameter. This matters because the app is open
+to the home WiFi and receives text from anyone.
 
 ---
 
-## 8. La vista del celular (`/`)
+## 7. The screen (`/screen`)
 
-### Entrada
+Full screen, dark background, designed to be read from a distance. Connects
+over WebSocket and reacts to whatever the server sends.
 
-La primera vez pide solo un nombre. Se guarda en `sessions` y se pone una cookie
-de larga duracion, para que al volver no lo pida otra vez. Sin contrasena.
+### Waiting mode
 
-### Vista principal
+When nothing is playing:
 
-1. **Buscador** arriba, grande. Escribe, toca buscar, salen resultados con
-   miniatura, titulo, canal y duracion. Un boton para agregar.
-2. **La cola completa**, en orden, con: numero, titulo, quien la pidio y estado
-   (descargando con progreso, lista, o sonando). La que suena, resaltada.
-3. Cada quien puede quitar sus propias canciones, no las de los demas.
-4. Actualizacion en vivo por el mismo WebSocket: si alguien agrega algo, todos
-   lo ven sin recargar.
+- Big title: "Karaoke".
+- **Two QR codes side by side**, generated with `segno` as SVG:
+  - Left: join the WiFi. Uses the standard format
+    `WIFI:T:WPA;S:<ssid>;P:<password>;;`, which Android and iOS recognize to
+    join with one scan. SSID and password come from environment variables,
+    never from the code.
+  - Right: open the app, `http://<lan_ip>:8004`. The IP is detected
+    automatically at startup, not typed in by hand.
+- Below, two lines of instructions.
+- If there are songs in the queue but none ready yet, show "downloading..."
+  with the upcoming ones.
 
-### Modo admin
+### Playing mode
 
-Un enlace discreto abajo, "admin". Pide contrasena (variable de entorno
-`KARAOKE_ADMIN_PASSWORD`, nunca en el codigo ni en git). Al acertar, marca
-`is_admin` en la sesion y aparecen los controles:
+- The video fills the screen, with no native controls.
+- **Sliding top bar** that shows and hides by itself: shows what's playing
+  (title and who requested it), the next TWO in the queue, and a small QR code
+  to open the app so anyone can add a song mid-song. Visible for the first 10
+  seconds of each song, then slides up, and comes back for the last 15
+  seconds. It also appears when the queue changes.
+- Three seconds before the end, a big notice of who's up next.
+- **While paused**, a dark overlay with "PAUSED" and the same two QR codes as
+  the waiting screen, for anyone who wants to join the queue or lost the link.
+- Nothing else on screen. The full queue is on the phone, not here.
 
-- Saltar a la siguiente cancion.
-- Pausar y reanudar.
-- Reordenar la cola (subir y bajar, o arrastrar).
-- Quitar cualquier cancion, no solo las propias.
-- Agregar canciones igual que todos.
-- Vaciar la cola.
-- Control de volumen del sistema.
+### Technical details to solve
 
-Los controles de admin son los unicos endpoints que verifican permiso. Verificar
-**en el servidor**, en cada peticion, no solo escondiendo botones en la UI.
+- **Autoplay**: browsers block automatic playback with sound. Chromium in
+  kiosk mode needs `--autoplay-policy=no-user-gesture-required`. It goes in the
+  launch script, documented in the README.
+- **Screensaver**: turn it off with `xset s off -dpms` before launching the
+  kiosk, or the screen goes black mid-party.
+- **End of song**: the `<video>`'s `ended` event notifies the server over
+  WebSocket, and the server decides what's next. The screen never decides on
+  its own: state lives on the server.
+- **Reconnection**: if the WebSocket drops, retry every 2 seconds without
+  reloading the page, so the video isn't interrupted.
+
+---
+
+## 8. The phone view (`/`)
+
+### Sign-in
+
+The first time it only asks for a name. It's stored in `sessions` and a
+long-lived cookie is set, so it isn't asked again on return. No password.
+
+### Main view
+
+1. **Search** at the top, big. Type, tap search, results come up with
+   thumbnail, title, channel and duration. A button to add.
+2. **The full queue**, in order, with: number, title, who requested it and
+   status (downloading with progress, ready, or playing). The playing one is
+   highlighted.
+3. Everyone can remove their own songs, not other people's.
+4. Live updates over the same WebSocket: if someone adds something, everyone
+   sees it without reloading.
+
+### Admin mode
+
+A discreet link at the bottom, "admin". Asks for a password (environment
+variable `KARAOKE_ADMIN_PASSWORD`, never in the code or in git). When correct,
+it sets `is_admin` on the session and the controls appear:
+
+- Skip to the next song.
+- Pause and resume.
+- Reorder the queue (move up and down, or drag).
+- Remove any song, not just your own.
+- Add songs like everyone else.
+- Clear the queue.
+- System volume control.
+
+The admin controls are the only endpoints that check permission. Check **on
+the server**, on every request, not just by hiding buttons in the UI.
 
 ---
 
@@ -261,85 +268,86 @@ Los controles de admin son los unicos endpoints que verifican permiso. Verificar
 
 ### HTTP
 
-- `GET /` → vista movil (o el formulario de nombre si no hay sesion)
-- `POST /session` → guarda el nombre, pone la cookie
-- `GET /pantalla` → vista de la tele
-- `GET /buscar?q=...&karaoke=1` → resultados de busqueda (fragmento HTMX)
-- `POST /queue` → agrega `video_id` a la cola
-- `DELETE /queue/{id}` → quita (propia, o cualquiera si es admin)
-- `GET /media/{video_id}.mp4` → sirve el archivo con soporte de Range, que el
-  navegador necesita para buscar dentro del video
-- `POST /admin/login` → verifica contrasena
+- `GET /` → phone view (or the name form if there's no session)
+- `POST /session` → stores the name, sets the cookie
+- `GET /screen` → TV view
+- `GET /search?q=...&karaoke=1` → search results (HTMX fragment)
+- `POST /queue` → adds `video_id` to the queue
+- `DELETE /queue/{id}` → removes (your own, or any if admin)
+- `GET /media/{video_id}.mp4` → serves the file with Range support, which the
+  browser needs to seek within the video
+- `POST /admin/login` → checks the password
 - `POST /admin/skip`, `/admin/pause`, `/admin/reorder`, `/admin/clear`
-- `POST /admin/volume` → llama a `pactl set-sink-volume @DEFAULT_SINK@`
+- `POST /admin/volume` → calls `pactl set-sink-volume @DEFAULT_SINK@`
 
 ### WebSocket `/ws`
 
-Mensajes del servidor a los clientes:
+Messages from the server to clients:
 
-- `state`: estado completo (lo que suena, la cola, y el modo de la pantalla).
-  Se manda al conectar y cuando cambia algo.
-- `progress`: avance de descarga de una cancion.
+- `state`: full state (what's playing, the queue, and the screen mode:
+  `playing` or `waiting`). Sent on connect and whenever something changes.
+- `progress`: download progress of a song.
 
-Mensajes de la pantalla al servidor:
+Messages from the screen to the server:
 
-- `ended`: termino la cancion actual.
-- `error`: el video no se pudo reproducir. El servidor lo marca `failed` y
-  avanza.
+- `ended`: the current song finished.
+- `error`: the video couldn't be played. The server marks it `failed` and
+  advances.
 
-Todo cambio de estado se transmite a todos los clientes conectados.
+Every state change is broadcast to all connected clients.
 
 ---
 
-## 10. Despliegue
+## 10. Deployment
 
-`deploy/karaoke.service`: usuario `rober`, puerto 8004,
-`EnvironmentFile=/home/rober/karaoke/.env` con la contrasena de admin y los
-datos del WiFi para el QR. El `.env` va en `.gitignore`.
+`deploy/karaoke.service`: user `rober`, port 8004,
+`EnvironmentFile=/home/rober/karaoke/.env` with the admin password and the
+WiFi details for the QR code. `.env` is in `.gitignore`.
 
-`deploy/kiosko.sh`: apaga el protector de pantalla y lanza Chromium en kiosko
-apuntando a `/pantalla`, con la bandera de autoplay. Pensado para llamarse
-desde un alias.
+`deploy/kiosk.sh`: turns off the screensaver and launches Chromium in kiosk
+mode pointing at `/screen`, with the autoplay flag. Meant to be called from an
+alias.
 
-Regla de firewall, documentada en el README:
+Firewall rule, documented in the README:
 
 ```bash
 sudo ufw allow from 192.168.0.0/16 to any port 8004 proto tcp
 ```
 
-Ese rango hay que ajustarlo a la subred real de la casa. Solo LAN: nada de
-abrirlo a internet.
+That range must be adjusted to the home's real subnet. LAN only: never open it
+to the internet.
 
-Aliases sugeridos para `~/.bash_aliases` (el archivo ya existe y tiene su
-funcion `halp`, hay que respetar el formato de comentarios `# nombre: que hace`
-para que aparezcan solos en la ayuda):
+Suggested aliases for `~/.bash_aliases` (the file already exists and has its
+`halp` function; keep the `# name: what it does` comment format so they show
+up in the help automatically):
 
 ```bash
-# karaoke: lanza la pantalla de karaoke en el monitor
-# karaoke-off: cierra la pantalla de karaoke
+# karaoke: launches the karaoke screen on the monitor
+# karaoke-off: closes the karaoke screen
 ```
 
 ---
 
 ## 11. Tests
 
-- Maquina de estados: nunca dos canciones en `playing` a la vez.
-- Avance: si la siguiente esta `downloading`, se salta a la primera `ready` y la
-  saltada conserva su posicion.
-- Cola vacia o sin nada listo: la pantalla vuelve a modo espera.
-- Cache: agregar una cancion ya descargada la deja en `ready` sin descargar.
-- Permisos: un usuario normal no puede quitar canciones ajenas ni llamar
-  endpoints de admin. Probar llamando el endpoint directo, no solo la UI.
-- Busqueda: una consulta con comillas, punto y coma y acentos no rompe nada.
-- Generacion del QR de WiFi con SSID y contrasena que traigan caracteres que el
-  formato requiere escapar.
+- State machine: never two songs in `playing` at once.
+- Advance: if the next one is `downloading`, skip to the first `ready` one and
+  the skipped one keeps its position.
+- Empty queue or nothing ready: the screen goes back to waiting mode.
+- Cache: adding an already downloaded song leaves it in `ready` without
+  downloading.
+- Permissions: a normal user can't remove other people's songs or call admin
+  endpoints. Test by calling the endpoint directly, not only through the UI.
+- Search: a query with quotes, semicolons and accents doesn't break anything.
+- WiFi QR generation with an SSID and password containing characters the
+  format requires escaping.
 
-Los tests no deben llamar a YouTube: simular las respuestas de yt-dlp.
+Tests must not call YouTube: fake yt-dlp's responses.
 
 ---
 
-## 12. Fuera de alcance
+## 12. Out of scope
 
-Sin puntuaciones, sin efectos de voz, sin microfono conectado a la compu, sin
-turnos rotativos por persona, sin cuentas permanentes, sin listas guardadas.
-Si el sistema se usa y queda gusto, se agregan despues.
+No scoring, no voice effects, no microphone connected to the computer, no
+per-person rotating turns, no permanent accounts, no saved playlists. If the
+system gets used and people like it, these can be added later.

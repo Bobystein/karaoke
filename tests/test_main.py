@@ -1,5 +1,5 @@
-"""Tests de HTTP y WebSocket. Los permisos se prueban llamando los endpoints
-directo, no a traves de la UI. Nada llama a YouTube."""
+"""HTTP and WebSocket tests. Permissions are tested by calling the endpoints
+directly, not through the UI. Nothing calls YouTube."""
 
 import json
 import time
@@ -21,9 +21,9 @@ def cfg(tmp_path):
     return Config(
         db_path=tmp_path / "k.db",
         media_dir=tmp_path / "media",
-        admin_password="secreto",
-        wifi_ssid="Casa",
-        wifi_password="clave",
+        admin_password="secret",
+        wifi_ssid="Home",
+        wifi_password="key",
         screen_hosts=frozenset({"testclient"}),
     )
 
@@ -61,7 +61,7 @@ def admin(k):
 
 
 def cached(k, vid):
-    db.upsert_song(k.conn, vid, f"Cancion {vid}", "Canal", 180, None)
+    db.upsert_song(k.conn, vid, f"Song {vid}", "Channel", 180, None)
     f = Path(k.cfg.media_dir) / f"{vid}.mp4"
     f.write_bytes(b"0123456789" * 100)
     db.set_song_file(k.conn, vid, str(f))
@@ -76,7 +76,7 @@ def wait_for(cond, timeout=3.0):
     return False
 
 
-# --- sesion -------------------------------------------------------------------
+# --- session ------------------------------------------------------------------
 
 def test_root_without_session_asks_name(client):
     r = client.get("/")
@@ -98,13 +98,13 @@ def test_empty_name_rejected(client):
 
 
 def test_endpoints_require_session(client):
-    assert client.get("/buscar?q=x").status_code == 401
+    assert client.get("/search?q=x").status_code == 401
     assert client.post("/queue", data={"video_id": VID_A}).status_code == 401
     assert client.delete("/queue/1").status_code == 401
     assert client.post("/admin/skip").status_code == 401
 
 
-# --- busqueda -----------------------------------------------------------------
+# --- search -------------------------------------------------------------------
 
 def test_search_weird_query_and_escaped_results(client, ana, monkeypatch):
     seen = {}
@@ -116,7 +116,7 @@ def test_search_weird_query_and_escaped_results(client, ana, monkeypatch):
 
     monkeypatch.setattr(downloader, "search", fake_search)
     q = 'canción "ñoña"; DROP TABLE queue; --'
-    r = client.get("/buscar", params={"q": q, "karaoke": 0}, headers=as_(ana))
+    r = client.get("/search", params={"q": q, "karaoke": 0}, headers=as_(ana))
     assert r.status_code == 200
     assert seen == {"q": q, "k": False}
     assert "<script>alert" not in r.text
@@ -125,15 +125,15 @@ def test_search_weird_query_and_escaped_results(client, ana, monkeypatch):
 
 def test_search_error_is_shown_not_500(client, ana, monkeypatch):
     def boom(q, add_karaoke):
-        raise downloader.DownloadError("sin red")
+        raise downloader.DownloadError("no network")
 
     monkeypatch.setattr(downloader, "search", boom)
-    r = client.get("/buscar?q=x", headers=as_(ana))
+    r = client.get("/search?q=x", headers=as_(ana))
     assert r.status_code == 200
-    assert "sin red" in r.text
+    assert "no network" in r.text
 
 
-# --- cola ---------------------------------------------------------------------
+# --- queue --------------------------------------------------------------------
 
 def test_add_requires_known_song(client, ana):
     r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
@@ -143,7 +143,7 @@ def test_add_requires_known_song(client, ana):
 
 
 def test_add_cached_song_starts_playing_without_download(client, k, ana, monkeypatch):
-    monkeypatch.setattr(downloader, "download", lambda *a, **kw: pytest.fail("no debe descargar"))
+    monkeypatch.setattr(downloader, "download", lambda *a, **kw: pytest.fail("must not download"))
     cached(k, VID_A)
     r = client.post("/queue", data={"video_id": VID_A}, headers=as_(ana))
     assert r.status_code == 201
@@ -151,7 +151,7 @@ def test_add_cached_song_starts_playing_without_download(client, k, ana, monkeyp
 
 
 def test_add_from_search_downloads_then_plays(client, k, ana, monkeypatch):
-    k.remember_results([{"video_id": VID_NEW, "title": "Nueva", "channel": "C",
+    k.remember_results([{"video_id": VID_NEW, "title": "New", "channel": "C",
                          "duration_s": 100, "thumb_url": "t"}])
 
     def fake_download(video_id, media_dir, on_progress):
@@ -164,15 +164,15 @@ def test_add_from_search_downloads_then_plays(client, k, ana, monkeypatch):
     r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
     assert r.status_code == 201
     assert wait_for(lambda: (k.queue.current() or {}).get("video_id") == VID_NEW)
-    assert db.get_song(k.conn, VID_NEW)["title"] == "Nueva"
+    assert db.get_song(k.conn, VID_NEW)["title"] == "New"
 
 
 def test_download_failure_marks_failed_and_keeps_going(client, k, ana, monkeypatch):
-    k.remember_results([{"video_id": VID_NEW, "title": "Mala", "channel": None,
+    k.remember_results([{"video_id": VID_NEW, "title": "Bad", "channel": None,
                          "duration_s": None, "thumb_url": None}])
 
     def bad(*a):
-        raise downloader.DownloadError("formato no reproducible en navegador: video=vp9")
+        raise downloader.DownloadError("format not playable in the browser: video=vp9")
 
     monkeypatch.setattr(downloader, "download", bad)
     r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
@@ -214,7 +214,7 @@ ADMIN_CALLS = [
 
 @pytest.mark.parametrize("path,data", ADMIN_CALLS)
 def test_admin_endpoints_forbidden_for_normal_user(client, k, ana, path, data, monkeypatch):
-    monkeypatch.setattr(main, "run_pactl", lambda args: pytest.fail("no debe llamar pactl"))
+    monkeypatch.setattr(main, "run_pactl", lambda args: pytest.fail("must not call pactl"))
     cached(k, VID_A)
     cached(k, VID_B)
     k.queue.add(VID_A, ana)
@@ -228,7 +228,7 @@ def test_admin_endpoints_forbidden_for_normal_user(client, k, ana, path, data, m
 def test_admin_login(client, k, ana):
     assert client.post("/admin/login", data={"password": "nop"}, headers=as_(ana)).status_code == 403
     assert not db.get_session(k.conn, ana["id"])["is_admin"]
-    r = client.post("/admin/login", data={"password": "secreto"}, headers=as_(ana))
+    r = client.post("/admin/login", data={"password": "secret"}, headers=as_(ana))
     assert r.status_code == 200
     assert db.get_session(k.conn, ana["id"])["is_admin"] == 1
     assert client.post("/admin/clear", headers=as_(ana)).status_code == 200
@@ -255,16 +255,16 @@ def test_admin_skip_pause_reorder_clear(client, k, ana, admin):
 
     assert client.post("/admin/skip", headers=as_(admin)).status_code == 200
     assert k.queue.current()["video_id"] == VID_B
-    assert k.paused is False  # la cancion nueva arranca sonando
+    assert k.paused is False  # the new song starts playing
 
-    client.post("/admin/pause", headers=as_(admin))  # pausa b
+    client.post("/admin/pause", headers=as_(admin))  # pause b
     pending = [i["id"] for i in k.queue.pending()]
     assert len(pending) == 1
     db.upsert_song(k.conn, VID_A, "A")
     extra = k.queue.add(VID_A, ana)
     client.post("/admin/reorder", data={"id": extra["id"], "delta": -1}, headers=as_(admin))
     assert [i["id"] for i in k.queue.pending()] == [extra["id"], pending[0]]
-    assert k.paused is True  # reordenar no toca la pausa
+    assert k.paused is True  # reordering doesn't touch the pause
 
     assert client.post("/admin/reorder", data={"order": "x,y"}, headers=as_(admin)).status_code == 400
     assert client.post("/admin/reorder", headers=as_(admin)).status_code == 400
@@ -305,7 +305,7 @@ def test_media_rejects_bad_ids(client):
     assert client.get("/media/abc.mp4").status_code == 404
 
 
-# --- QR y pantalla ------------------------------------------------------------
+# --- QR and screen ----------------------------------------------------------
 
 @pytest.mark.parametrize(
     "ssid,password,expected",
@@ -325,12 +325,20 @@ def test_wifi_qr_with_special_chars_renders(tmp_path):
     assert svg.startswith("<svg") and "</svg>" in svg
 
 
-def test_pantalla_has_two_qrs(client, k):
-    r = client.get("/pantalla")
+def test_screen_has_two_qrs(client, k):
+    r = client.get("/screen")
     assert r.status_code == 200
     assert k.app_url.endswith(":8004")
     assert k.wifi_qr is not None
     assert k.wifi_qr in r.text and k.app_qr in r.text
+
+
+def test_screen_shows_qrs_while_paused_and_in_bar(client, k):
+    html = client.get("/screen").text
+    paused = html.split('id="paused"', 1)[1].split("</section>", 1)[0]
+    assert k.app_qr in paused and k.wifi_qr in paused
+    bar = html.split('id="bar"', 1)[1].split("</header>", 1)[0]
+    assert k.app_qr in bar
 
 
 # --- WebSocket ----------------------------------------------------------------
@@ -342,7 +350,7 @@ def test_ws_sends_state_without_session_ids(client, k, ana):
     with client.websocket_connect("/ws") as ws:
         msg = ws.receive_json()
     assert msg["type"] == "state"
-    assert msg["mode"] == "reproduccion"
+    assert msg["mode"] == "playing"
     assert msg["current"]["owner"] == owner_tag(ana["id"])
     assert ana["id"] not in json.dumps(msg)
 
@@ -360,12 +368,12 @@ def test_ws_ended_advances_and_broadcasts(client, k, ana):
         s1 = screen.receive_json()
         p1 = phone.receive_json()
         assert s1["current"]["video_id"] == VID_B == p1["current"]["video_id"]
-        # `ended` repetido de la anterior no se salta la actual
+        # a repeated `ended` for the previous song doesn't skip the current one
         screen.send_text(json.dumps({"type": "ended", "id": a["id"]}))
-        screen.send_text("esto no es json")
+        screen.send_text("this is not json")
         screen.send_text(json.dumps({"type": "ended", "id": s1["current"]["id"]}))
         s2 = screen.receive_json()
-        assert s2["mode"] == "espera"
+        assert s2["mode"] == "waiting"
 
 
 def test_ws_error_marks_failed(client, k, ana):
@@ -376,12 +384,12 @@ def test_ws_error_marks_failed(client, k, ana):
         screen.receive_json()
         screen.send_text(json.dumps({"type": "error", "id": a["id"], "error": "MEDIA_ERR_DECODE"}))
         msg = screen.receive_json()
-    assert msg["mode"] == "espera"
+    assert msg["mode"] == "waiting"
     assert msg["failed"][0]["error"] == "MEDIA_ERR_DECODE"
 
 
 def test_ws_ended_ignored_from_non_screen_host(tmp_path):
-    cfg = Config(db_path=tmp_path / "k.db", media_dir=tmp_path / "m")  # solo localhost
+    cfg = Config(db_path=tmp_path / "k.db", media_dir=tmp_path / "m")  # localhost only
     with TestClient(create_app(cfg)) as c:
         k = c.app.state.k
         ana = db.create_session(k.conn, "Ana")
@@ -395,27 +403,27 @@ def test_ws_ended_ignored_from_non_screen_host(tmp_path):
         assert k.queue.current()["id"] == a["id"]
 
 
-# --- vista movil ----------------------------------------------------------------
+# --- mobile view ----------------------------------------------------------------
 
-def test_movil_view_for_guest(client, ana):
+def test_mobile_view_for_guest(client, ana):
     r = client.get("/", headers=as_(ana))
     assert r.status_code == 200
-    assert 'hx-get="/buscar"' in r.text
+    assert 'hx-get="/search"' in r.text
     assert f'data-owner="{owner_tag(ana["id"])}"' in r.text
     assert 'data-admin="0"' in r.text
-    assert 'id="admin-login"' in r.text  # enlace discreto
-    assert 'id="admin"' not in r.text  # sin controles
+    assert 'id="admin-login"' in r.text  # discreet link
+    assert 'id="admin"' not in r.text  # no controls
     assert ana["id"] not in r.text
 
 
-def test_movil_view_for_admin(client, admin):
+def test_mobile_view_for_admin(client, admin):
     r = client.get("/", headers=as_(admin))
     assert 'data-admin="1"' in r.text
     assert 'data-admin-action="skip"' in r.text
     assert 'id="admin-login"' not in r.text
 
 
-def test_movil_hides_admin_link_when_disabled(tmp_path):
+def test_mobile_hides_admin_link_when_disabled(tmp_path):
     cfg = Config(db_path=tmp_path / "k.db", media_dir=tmp_path / "m", admin_password="")
     with TestClient(create_app(cfg)) as c:
         s = db.create_session(c.app.state.k.conn, "X")
@@ -425,35 +433,44 @@ def test_movil_hides_admin_link_when_disabled(tmp_path):
 def test_results_have_add_buttons(client, ana, monkeypatch):
     monkeypatch.setattr(downloader, "search", lambda q, k: [
         {"video_id": VID_A, "title": "Cielito", "channel": "C", "duration_s": 185, "thumb_url": "t"}])
-    r = client.get("/buscar?q=cielito&karaoke=1", headers=as_(ana))
+    r = client.get("/search?q=cielito&karaoke=1", headers=as_(ana))
     assert 'hx-post="/queue"' in r.text
     assert "3:05" in r.text
     assert "&#34;video_id&#34;: &#34;aaaaaaaaaaa&#34;" in r.text or '"video_id": "aaaaaaaaaaa"' in r.text
     r = client.post("/queue", data={"video_id": VID_A}, headers=as_(ana))
-    assert "En la cola" in r.text
+    assert "Queued" in r.text
 
 
 def test_search_checkbox_off_means_no_karaoke(client, ana, monkeypatch):
     seen = []
     monkeypatch.setattr(downloader, "search", lambda q, k: seen.append(k) or [])
-    client.get("/buscar?q=x", headers=as_(ana))  # casilla desmarcada: no viene el campo
-    client.get("/buscar?q=x&karaoke=1", headers=as_(ana))
+    client.get("/search?q=x", headers=as_(ana))  # unchecked box: the field isn't sent
+    client.get("/search?q=x&karaoke=1", headers=as_(ana))
     assert seen == [False, True]
 
 
-# --- pantalla -------------------------------------------------------------------
+# --- screen ---------------------------------------------------------------------
 
-def test_pantalla_works_offline_and_has_no_controls(client):
-    html = client.get("/pantalla").text
-    assert "cdn." not in html and "https://" not in html  # nada externo
+def test_screen_works_offline_and_has_no_controls(client):
+    html = client.get("/screen").text
+    assert "cdn." not in html and "https://" not in html  # nothing external
     assert "<video" in html and "controls" not in html.split("<video", 1)[1].split(">", 1)[0]
-    assert '/static/pantalla.js' in html and '/static/ws.js' in html
-    assert client.get("/static/pantalla.js").status_code == 200
+    assert '/static/screen.js' in html and '/static/ws.js' in html
+    assert client.get("/static/screen.js").status_code == 200
 
 
-def test_pantalla_without_wifi_config(tmp_path):
+def test_screen_without_wifi_config(tmp_path):
     cfg = Config(db_path=tmp_path / "k.db", media_dir=tmp_path / "m")
     with TestClient(create_app(cfg)) as c:
-        html = c.get("/pantalla").text
-        assert "Falta configurar KARAOKE_WIFI_SSID" in html
-        assert html.count("<svg") == 1  # solo el de la app
+        html = c.get("/screen").text
+        assert "KARAOKE_WIFI_SSID is not set" in html
+        # Only the app QR: waiting screen, up-next bar and pause overlay.
+        assert html.count("<svg") == 3
+        assert html.count(c.app.state.k.app_qr) == 3
+
+
+def test_media_dir_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("KARAOKE_MEDIA_DIR", str(tmp_path / "songs"))
+    assert Config.from_env().media_dir == tmp_path / "songs"
+    monkeypatch.delenv("KARAOKE_MEDIA_DIR")
+    assert Config.from_env().media_dir == downloader.DEFAULT_MEDIA_DIR

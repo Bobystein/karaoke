@@ -1,7 +1,7 @@
-"""Envoltura de yt-dlp: busqueda y descarga.
+"""yt-dlp wrapper: search and download.
 
-yt-dlp se usa como libreria. La consulta del usuario es un parametro de
-Python, nunca se interpola en una linea de comando.
+yt-dlp is used as a library. The user's query is a Python parameter, never
+interpolated into a command line.
 """
 
 import re
@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import yt_dlp
-from yt_dlp import YoutubeDL  # referencia de modulo para poder simularlo en tests
+from yt_dlp import YoutubeDL  # module-level reference so tests can fake it
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MEDIA_DIR = ROOT / "media"
@@ -18,8 +18,8 @@ SEARCH_RESULTS = 12
 MAX_DURATION_S = 15 * 60
 MAX_QUERY_LEN = 200
 
-# H.264 + AAC en mp4: lo que el navegador reproduce nativo y la UHD 620
-# decodifica por hardware.
+# H.264 + AAC in mp4: what the browser plays natively and the UHD 620
+# decodes in hardware.
 FORMAT = (
     "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]"
     "/best[height<=1080][ext=mp4]"
@@ -36,7 +36,7 @@ BASE_OPTS = {
 
 
 class DownloadError(Exception):
-    """La descarga fallo. El mensaje se guarda en queue.error y se muestra al usuario."""
+    """The download failed. The message is stored in queue.error and shown to the user."""
 
 
 def is_valid_video_id(video_id: str) -> bool:
@@ -47,7 +47,7 @@ def thumb_for(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
 
 
-# --- busqueda ---------------------------------------------------------------
+# --- search -----------------------------------------------------------------
 
 def build_query(query: str, add_karaoke: bool = True) -> str:
     q = " ".join((query or "").split())[:MAX_QUERY_LEN]
@@ -57,7 +57,7 @@ def build_query(query: str, add_karaoke: bool = True) -> str:
 
 
 def search(query: str, add_karaoke: bool = True) -> list[dict]:
-    """Busca en YouTube. Devuelve dicts con video_id, title, channel, duration_s, thumb_url."""
+    """Searches YouTube. Returns dicts with video_id, title, channel, duration_s, thumb_url."""
     q = build_query(query, add_karaoke)
     if not q:
         return []
@@ -66,7 +66,7 @@ def search(query: str, add_karaoke: bool = True) -> list[dict]:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{q}", download=False)
     except yt_dlp.utils.DownloadError as e:
-        raise DownloadError(f"la busqueda fallo: {_clean(e)}") from e
+        raise DownloadError(f"search failed: {_clean(e)}") from e
 
     results = []
     for entry in (info or {}).get("entries") or []:
@@ -74,11 +74,11 @@ def search(query: str, add_karaoke: bool = True) -> list[dict]:
             continue
         vid = entry.get("id")
         if not is_valid_video_id(vid):
-            continue  # canales, listas, etc.
+            continue  # channels, playlists, etc.
         duration = entry.get("duration")
         duration = int(duration) if duration else None
         if duration and duration > MAX_DURATION_S:
-            continue  # recopilaciones
+            continue  # compilations
         results.append(
             {
                 "video_id": vid,
@@ -91,16 +91,16 @@ def search(query: str, add_karaoke: bool = True) -> list[dict]:
     return results
 
 
-# --- descarga ---------------------------------------------------------------
+# --- download ---------------------------------------------------------------
 
 def media_path(video_id: str, media_dir: Path = DEFAULT_MEDIA_DIR) -> Path:
     if not is_valid_video_id(video_id):
-        raise DownloadError(f"id de video invalido: {video_id!r}")
+        raise DownloadError(f"invalid video id: {video_id!r}")
     return Path(media_dir) / f"{video_id}.mp4"
 
 
 def _codecs(info: dict) -> tuple[str, str, str]:
-    """(vcodec, acodec, ext) del formato elegido, sea combinado o un solo archivo."""
+    """(vcodec, acodec, ext) of the chosen format, whether merged or a single file."""
     parts = info.get("requested_formats") or [info]
     vcodec = next((p["vcodec"] for p in parts if p.get("vcodec") not in (None, "none")), "none")
     acodec = next((p["acodec"] for p in parts if p.get("acodec") not in (None, "none")), "none")
@@ -108,11 +108,11 @@ def _codecs(info: dict) -> tuple[str, str, str]:
 
 
 def check_playable(info: dict) -> None:
-    """Falla si el formato elegido no es H.264 + AAC en mp4."""
+    """Fails if the chosen format isn't H.264 + AAC in mp4."""
     vcodec, acodec, ext = _codecs(info)
     if not vcodec.startswith("avc1") or not acodec.startswith("mp4a") or ext != "mp4":
         raise DownloadError(
-            f"formato no reproducible en navegador: video={vcodec} audio={acodec} contenedor={ext}"
+            f"format not playable in the browser: video={vcodec} audio={acodec} container={ext}"
         )
 
 
@@ -121,11 +121,11 @@ def download(
     media_dir: Path = DEFAULT_MEDIA_DIR,
     on_progress: Callable[[float], None] | None = None,
 ) -> dict:
-    """Descarga el video a media/<video_id>.mp4 si no esta ya.
+    """Downloads the video to media/<video_id>.mp4 unless it's already there.
 
-    Devuelve {"file_path", "title", "channel", "duration_s", "cached"}.
-    `on_progress` recibe un porcentaje 0-100 (combina video y audio).
-    Lanza DownloadError con un motivo legible si algo falla.
+    Returns {"file_path", "title", "channel", "duration_s", "cached"}.
+    `on_progress` receives a 0-100 percentage (video and audio combined).
+    Raises DownloadError with a readable reason if anything fails.
     """
     target = media_path(video_id, media_dir)
     if target.is_file():
@@ -162,8 +162,8 @@ def download(
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         with YoutubeDL(opts) as ydl:
-            # Primero resolvemos el formato sin bajar nada, para rechazar
-            # antes de gastar red si no es reproducible.
+            # Resolve the format first without downloading, to reject it
+            # before spending bandwidth if it isn't playable.
             info = ydl.extract_info(url, download=False)
             check_playable(info)
             streams["total"] = len(info.get("requested_formats") or [info])
@@ -173,13 +173,13 @@ def download(
         raise DownloadError(_clean(e)) from e
     except DownloadError:
         raise
-    except Exception as e:  # cualquier otra cosa de yt-dlp o ffmpeg
+    except Exception as e:  # anything else from yt-dlp or ffmpeg
         _cleanup_partials(video_id, media_dir)
-        raise DownloadError(f"error inesperado: {e}") from e
+        raise DownloadError(f"unexpected error: {e}") from e
 
     if not target.is_file():
         _cleanup_partials(video_id, media_dir)
-        raise DownloadError("yt-dlp termino pero no dejo media/<id>.mp4")
+        raise DownloadError("yt-dlp finished but left no media/<id>.mp4")
 
     return {
         "file_path": str(target),
@@ -191,7 +191,7 @@ def download(
 
 
 def _cleanup_partials(video_id: str, media_dir: Path) -> None:
-    """Borra restos de una descarga fallida (.part, flujos sin unir). Nunca el .mp4 final."""
+    """Deletes leftovers of a failed download (.part, unmerged streams). Never the final .mp4."""
     final = Path(media_dir) / f"{video_id}.mp4"
     for f in Path(media_dir).glob(f"{video_id}.*"):
         if f != final:
@@ -200,5 +200,5 @@ def _cleanup_partials(video_id: str, media_dir: Path) -> None:
 
 def _clean(e: Exception) -> str:
     msg = str(e)
-    msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)  # colores ANSI
+    msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)  # ANSI colors
     return msg.removeprefix("ERROR: ").strip()[:300]

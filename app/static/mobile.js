@@ -1,6 +1,6 @@
-// Vista del celular: pinta la cola con el estado que manda el servidor por
-// WebSocket. Los permisos los verifica el servidor; aqui solo se esconden
-// botones que no aplican.
+// Phone view: draws the queue from the state the server sends over the
+// WebSocket. The server checks permissions; here we only hide buttons that
+// don't apply.
 (() => {
   const ME = document.body.dataset.owner;
   const IS_ADMIN = document.body.dataset.admin === "1";
@@ -8,7 +8,7 @@
 
   const $ = (id) => document.getElementById(id);
 
-  // --- avisos ---
+  // --- notices ---
 
   let toastTimer = null;
   function toast(text) {
@@ -35,7 +35,7 @@
         body: data ? new URLSearchParams(data) : undefined,
       });
     } catch {
-      toast("Sin conexión con el karaoke");
+      toast("Can't reach the karaoke");
       return null;
     }
     if (!resp.ok) {
@@ -45,26 +45,26 @@
     return resp;
   }
 
-  // Errores de las peticiones HTMX (busqueda y agregar).
+  // Errors from HTMX requests (search and add).
   document.body.addEventListener("htmx:responseError", async (e) => {
     const xhr = e.detail.xhr;
     let text = "Error " + xhr.status;
     try { text = JSON.parse(xhr.responseText).detail || text; } catch {}
     toast(text);
   });
-  document.body.addEventListener("htmx:sendError", () => toast("Sin conexión con el karaoke"));
+  document.body.addEventListener("htmx:sendError", () => toast("Can't reach the karaoke"));
 
-  // --- pintar la cola ---
+  // --- drawing the queue ---
 
   function badge(item) {
     const pct = item.progress;
     switch (item.state) {
       case "downloading":
-        return `<span class="text-sky-300">descargando${pct != null ? " " + Math.round(pct) + "%" : "…"}</span>`;
+        return `<span class="text-sky-300">downloading${pct != null ? " " + Math.round(pct) + "%" : "…"}</span>`;
       case "queued":
-        return `<span class="text-neutral-400">en espera</span>`;
+        return `<span class="text-neutral-400">waiting</span>`;
       case "ready":
-        return `<span class="text-emerald-300">lista</span>`;
+        return `<span class="text-emerald-300">ready</span>`;
       default:
         return "";
     }
@@ -82,7 +82,7 @@
     return IS_ADMIN || item.owner === ME;
   }
 
-  function removeButton(item, label = "Quitar") {
+  function removeButton(item, label = "Remove") {
     if (!canRemove(item)) return "";
     return `<button data-remove="${item.id}" class="shrink-0 rounded-xl bg-neutral-800 active:bg-neutral-700 px-3 py-2 text-sm">${label}</button>`;
   }
@@ -98,14 +98,14 @@
   function renderCurrent() {
     const cur = state.current;
     if (!cur) {
-      $("sonando").innerHTML = "";
+      $("now-playing").innerHTML = "";
       return;
     }
-    $("sonando").innerHTML = `
+    $("now-playing").innerHTML = `
       <div class="rounded-2xl bg-gradient-to-r from-fuchsia-700 to-violet-700 p-3 flex items-center gap-3 shadow-lg">
         ${cur.thumb_url ? `<img src="${escapeHtml(cur.thumb_url)}" alt="" class="w-20 aspect-video rounded-lg object-cover shrink-0">` : ""}
         <div class="min-w-0 flex-1">
-          <p class="text-xs uppercase tracking-widest text-fuchsia-200">${state.paused ? "En pausa" : "Sonando"}</p>
+          <p class="text-xs uppercase tracking-widest text-fuchsia-200">${state.paused ? "Paused" : "Now playing"}</p>
           <p class="font-bold leading-snug line-clamp-2">${escapeHtml(cur.title)}</p>
           <p class="text-sm text-fuchsia-100/80 truncate">${escapeHtml(cur.requested_by)}</p>
         </div>
@@ -116,12 +116,12 @@
   function renderQueue() {
     const items = state.queue;
     if (!items.length) {
-      $("cola").innerHTML = `<li class="text-neutral-500 py-2">${
-        state.current ? "No hay nada más en la cola." : "La cola está vacía. ¡Busca una canción!"
+      $("queue").innerHTML = `<li class="text-neutral-500 py-2">${
+        state.current ? "Nothing else in the queue." : "The queue is empty. Search for a song!"
       }</li>`;
       return;
     }
-    $("cola").innerHTML = items.map((item, idx) => `
+    $("queue").innerHTML = items.map((item, idx) => `
       <li class="flex items-center gap-3 rounded-2xl bg-neutral-900 p-3 ${item.owner === ME ? "ring-1 ring-fuchsia-500/40" : ""}">
         <span class="w-6 text-center text-lg font-black text-neutral-500 shrink-0">${idx + 1}</span>
         <div class="min-w-0 flex-1">
@@ -136,10 +136,10 @@
 
   function renderFailed() {
     const mine = state.failed.filter((f) => IS_ADMIN || f.owner === ME);
-    $("fallidas").innerHTML = mine.map((f) => `
+    $("failed").innerHTML = mine.map((f) => `
       <div class="rounded-2xl bg-red-950/60 border border-red-900 p-3 flex items-center gap-3">
         <div class="min-w-0 flex-1">
-          <p class="text-sm text-red-300">No se pudo ${f.owner === ME ? "poner tu canción" : "poner la de " + escapeHtml(f.requested_by)}:</p>
+          <p class="text-sm text-red-300">Couldn't play ${f.owner === ME ? "your song" : escapeHtml(f.requested_by) + "'s song"}:</p>
           <p class="font-semibold leading-snug line-clamp-2">${escapeHtml(f.title)}</p>
           <p class="text-xs text-red-300/80 break-words">${escapeHtml(f.error || "")}</p>
         </div>
@@ -148,8 +148,8 @@
   }
 
   function renderAdmin() {
-    const btn = $("btn-pausa");
-    if (btn) btn.textContent = state.paused ? "▶ Reanudar" : "⏸ Pausar";
+    const btn = $("btn-pause");
+    if (btn) btn.textContent = state.paused ? "▶ Resume" : "⏸ Pause";
   }
 
   function render() {
@@ -182,14 +182,14 @@
       }
     },
     (up) => {
-      const dot = $("conexion");
+      const dot = $("connection");
       dot.classList.toggle("bg-emerald-500", up);
       dot.classList.toggle("bg-red-500", !up);
       dot.classList.remove("bg-neutral-600");
     },
   );
 
-  // --- acciones ---
+  // --- actions ---
 
   document.addEventListener("click", async (e) => {
     const rm = e.target.closest("[data-remove]");
@@ -215,7 +215,7 @@
         await request("POST", "/admin/pause", { paused: state && state.paused ? "0" : "1" });
         break;
       case "clear":
-        if (confirm("¿Vaciar toda la cola? La canción que suena sigue.")) {
+        if (confirm("Clear the whole queue? The current song keeps playing.")) {
           await request("POST", "/admin/clear");
         }
         break;
@@ -223,7 +223,7 @@
       case "vol-up": {
         const delta = act.dataset.adminAction === "vol-up" ? 5 : -5;
         const resp = await request("POST", "/admin/volume", { delta });
-        if (resp) $("volumen").textContent = (delta > 0 ? "+" : "−") + "5%";
+        if (resp) $("volume").textContent = (delta > 0 ? "+" : "−") + "5%";
         break;
       }
     }

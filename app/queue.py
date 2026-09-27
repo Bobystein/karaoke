@@ -1,12 +1,12 @@
-"""Estado de la cola: la maquina de estados de SPEC.md, seccion 5.
+"""Queue state: the state machine from SPEC.md, section 5.
 
     queued ──→ downloading ──→ ready ──→ playing ──→ played
                   │
                   └──→ failed
 
-Ademas `removed` desde cualquier estado activo. Todo es sincrono y vive en
-SQLite; la orquestacion (hilos de descarga, broadcast por WebSocket) es de
-main.py, que llama estos metodos y luego transmite `snapshot()`.
+Plus `removed` from any active state. Everything is synchronous and lives
+in SQLite; orchestration (download threads, WebSocket broadcast) belongs to
+main.py, which calls these methods and then broadcasts `snapshot()`.
 """
 
 import sqlite3
@@ -16,7 +16,7 @@ from app import db
 
 MAX_CONCURRENT_DOWNLOADS = 2
 
-# Estados que cuentan como "en la cola" (pendientes de sonar).
+# States that count as "in the queue" (still waiting to play).
 PENDING = ("queued", "downloading", "ready")
 
 
@@ -31,10 +31,10 @@ class Forbidden(Exception):
 class Queue:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
-        # Las descargas terminan en otros hilos; serializamos todo acceso.
+        # Downloads finish on other threads; all access is serialized.
         self.lock = threading.RLock()
 
-    # --- lectura ------------------------------------------------------------
+    # --- reads --------------------------------------------------------------
 
     def _items(self, where: str, params: tuple = ()) -> list[dict]:
         rows = self.conn.execute(
@@ -69,36 +69,36 @@ class Queue:
         return items[0] if items else None
 
     def snapshot(self) -> dict:
-        """Estado completo que se manda a los clientes en el mensaje `state`."""
+        """Full state sent to clients in the `state` message."""
         with self.lock:
             current = self.current()
             pending = self.pending()
             return {
-                "mode": "reproduccion" if current else "espera",
+                "mode": "playing" if current else "waiting",
                 "current": current,
                 "queue": pending,
-                # Lo que la barra de la pantalla muestra como "siguientes".
+                # What the screen's bar shows as "up next".
                 "up_next": pending[:2],
-                # Quien sonara realmente despues (regla de avance).
+                # What will actually play next (advance rule).
                 "next_ready": self.next_ready(),
                 "failed": self.failed(),
             }
 
-    # --- alta ---------------------------------------------------------------
+    # --- adding -------------------------------------------------------------
 
     def _next_position(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM queue").fetchone()
         return row[0]
 
     def add(self, video_id: str, session: dict) -> dict:
-        """Agrega una peticion. Si la cancion ya esta en cache entra directo en `ready`.
+        """Adds a request. If the song is already cached it goes straight to `ready`.
 
-        La cancion debe existir en `songs` (main.py la registra desde el resultado
-        de busqueda con db.upsert_song antes de llamar esto).
+        The song must exist in `songs` (main.py registers it from the search
+        result with db.upsert_song before calling this).
         """
         with self.lock:
             if db.get_song(self.conn, video_id) is None:
-                raise NotFound(f"cancion desconocida: {video_id}")
+                raise NotFound(f"unknown song: {video_id}")
             state = "ready" if db.cached_file(self.conn, video_id) else "queued"
             cur = self.conn.execute(
                 """
@@ -109,14 +109,14 @@ class Queue:
             )
             return self.get(cur.lastrowid)
 
-    # --- descargas ----------------------------------------------------------
+    # --- downloads ----------------------------------------------------------
 
     def claim_downloads(self) -> list[str]:
-        """Pasa a `downloading` las siguientes peticiones en cola, respetando el limite.
+        """Moves the next queued requests to `downloading`, respecting the limit.
 
-        Devuelve los video_id que main.py debe empezar a descargar. Si el mismo
-        video ya se esta bajando para otra peticion no se baja dos veces: esa
-        peticion espera en `queued` y se marca lista junto con la otra.
+        Returns the video_ids main.py should start downloading. If the same
+        video is already downloading for another request it isn't fetched
+        twice: that request waits in `queued` and becomes ready with the other.
         """
         with self.lock, db.transaction(self.conn):
             active = {
@@ -134,7 +134,7 @@ class Queue:
                 if vid in active:
                     continue
                 if db.cached_file(self.conn, vid):
-                    # Bajo mientras esperaba (otra peticion del mismo video).
+                    # Downloaded while it was waiting (another request for the same video).
                     self.conn.execute(
                         "UPDATE queue SET state = 'ready' WHERE id = ?", (item["id"],)
                     )
@@ -165,11 +165,11 @@ class Queue:
                 (error, video_id),
             )
 
-    # --- reproduccion -------------------------------------------------------
+    # --- playback -----------------------------------------------------------
 
     def _start_next(self) -> dict | None:
-        """Regla de avance: la primera en `ready` por posicion. Las que siguen
-        bajando conservan su lugar. Sin nada listo, la pantalla queda en espera."""
+        """Advance rule: the first `ready` one by position. Songs still
+        downloading keep their spot. With nothing ready, the screen waits."""
         nxt = self.next_ready()
         if nxt is None:
             return None
@@ -184,17 +184,17 @@ class Queue:
         return self.get(nxt["id"])
 
     def start_if_idle(self) -> dict | None:
-        """Si no suena nada y hay algo listo, lo arranca. Devuelve lo que empezo."""
+        """If nothing is playing and something is ready, starts it. Returns what started."""
         with self.lock, db.transaction(self.conn):
             if self.current() is not None:
                 return None
             return self._start_next()
 
     def advance(self, expected_id: int | None = None) -> dict | None:
-        """Termina la actual (`played`) y arranca la siguiente lista.
+        """Finishes the current song (`played`) and starts the next ready one.
 
-        `expected_id` protege contra un `ended` duplicado o tardio: si la que
-        suena ya no es esa, no se hace nada.
+        `expected_id` guards against a duplicate or late `ended`: if that is no
+        longer the song playing, nothing happens.
         """
         with self.lock, db.transaction(self.conn):
             cur = self.current()
@@ -207,7 +207,7 @@ class Queue:
             return self._start_next()
 
     def fail_current(self, error: str, expected_id: int | None = None) -> dict | None:
-        """La pantalla no pudo reproducir: `failed` y avanzar."""
+        """The screen couldn't play it: mark `failed` and advance."""
         with self.lock, db.transaction(self.conn):
             cur = self.current()
             if cur is None or (expected_id is not None and cur["id"] != expected_id):
@@ -217,19 +217,19 @@ class Queue:
             )
             return self._start_next()
 
-    # --- edicion ------------------------------------------------------------
+    # --- editing ------------------------------------------------------------
 
     def remove(self, item_id: int, session: dict) -> bool:
-        """Quita una peticion (propia, o cualquiera si es admin).
+        """Removes a request (your own, or any if admin).
 
-        Devuelve True si se quito la que sonaba (y entonces ya arranco la siguiente).
+        Returns True if the playing song was removed (the next one has then started).
         """
         with self.lock, db.transaction(self.conn):
             item = self.get(item_id)
             if item is None or item["state"] in ("played", "removed"):
-                raise NotFound(f"no existe la peticion {item_id}")
+                raise NotFound(f"request {item_id} does not exist")
             if not session.get("is_admin") and item["session_id"] != session["id"]:
-                raise Forbidden("solo puedes quitar tus propias canciones")
+                raise Forbidden("you can only remove your own songs")
             self.conn.execute("UPDATE queue SET state = 'removed' WHERE id = ?", (item_id,))
             if item["state"] == "playing":
                 self._start_next()
@@ -237,10 +237,10 @@ class Queue:
             return False
 
     def reorder(self, ordered_ids: list[int]) -> None:
-        """Reasigna posiciones a las pendientes en el orden dado (solo admin).
+        """Reassigns positions of pending requests in the given order (admin only).
 
-        Las pendientes que no vengan en la lista se quedan al final en su orden
-        actual, para que una lista desactualizada no pierda canciones.
+        Pending requests missing from the list stay at the end in their current
+        order, so a stale list never loses songs.
         """
         with self.lock, db.transaction(self.conn):
             pending = [i["id"] for i in self.pending()]
@@ -257,18 +257,18 @@ class Queue:
                 )
 
     def move(self, item_id: int, delta: int) -> None:
-        """Sube (delta < 0) o baja (delta > 0) una peticion pendiente."""
+        """Moves a pending request up (delta < 0) or down (delta > 0)."""
         with self.lock:
             ids = [i["id"] for i in self.pending()]
             if item_id not in ids:
-                raise NotFound(f"no esta en la cola: {item_id}")
+                raise NotFound(f"not in the queue: {item_id}")
             idx = ids.index(item_id)
             new = max(0, min(len(ids) - 1, idx + delta))
             ids.insert(new, ids.pop(idx))
             self.reorder(ids)
 
     def clear(self) -> None:
-        """Vacia la cola pendiente y los fallidos. La que suena sigue sonando."""
+        """Clears pending and failed requests. The current song keeps playing."""
         with self.lock:
             self.conn.execute(
                 "UPDATE queue SET state = 'removed' "
@@ -276,6 +276,6 @@ class Queue:
             )
 
     def recover(self) -> None:
-        """Al arrancar: las descargas interrumpidas vuelven a la cola."""
+        """On startup: interrupted downloads go back to the queue."""
         with self.lock:
             self.conn.execute("UPDATE queue SET state = 'queued' WHERE state = 'downloading'")

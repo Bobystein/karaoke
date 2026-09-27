@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Abre el puerto 8004 solo a la red de la casa. Nada de internet.
-# Uso: deploy/ufw.sh [subred]   (por omision la de coatl: 192.168.0.0/24)
+# Opens port 8004 to the home network only. Never the internet.
+# Usage: deploy/ufw.sh [subnet]   (defaults to coatl's: 192.168.0.0/24)
 set -euo pipefail
 
-SUBRED="${1:-192.168.0.0/24}"
-sudo ufw allow from "$SUBRED" to any port 8004 proto tcp comment 'karaoke (solo LAN)'
+SUBNET="${1:-192.168.0.0/24}"
+sudo ufw allow from "$SUBNET" to any port 8004 proto tcp comment 'karaoke (LAN only)'
 sudo ufw status | grep 8004

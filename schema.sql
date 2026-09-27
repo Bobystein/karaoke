@@ -1,32 +1,32 @@
--- Quien esta en la fiesta. Sin contrasena, solo un nombre.
+-- Who's at the party. No password, just a name.
 CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,        -- uuid4, va en cookie
+    id          TEXT PRIMARY KEY,        -- uuid4, stored in a cookie
     name        TEXT NOT NULL,
     is_admin    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Cache de videos ya descargados. La clave es el id de YouTube.
+-- Cache of downloaded videos. The key is the YouTube id.
 CREATE TABLE IF NOT EXISTS songs (
     video_id     TEXT PRIMARY KEY,
     title        TEXT NOT NULL,
     channel      TEXT,
     duration_s   INTEGER,
-    file_path    TEXT,                   -- NULL mientras no se ha descargado
+    file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
     downloaded_at TEXT,
     play_count   INTEGER NOT NULL DEFAULT 0
 );
 
--- La cola. Un renglon por peticion, aunque la cancion se repita.
+-- The queue. One row per request, even if the song repeats.
 CREATE TABLE IF NOT EXISTS queue (
     id            INTEGER PRIMARY KEY,
     video_id      TEXT NOT NULL REFERENCES songs(video_id),
     session_id    TEXT REFERENCES sessions(id),
-    requested_by  TEXT NOT NULL,          -- copia del nombre, por si se borra la sesion
-    state         TEXT NOT NULL           -- ver maquina de estados en SPEC.md
+    requested_by  TEXT NOT NULL,          -- copy of the name, in case the session is deleted
+    state         TEXT NOT NULL           -- see the state machine in SPEC.md
                   CHECK (state IN ('queued','downloading','ready','playing','played','failed','removed')),
-    position      INTEGER NOT NULL,       -- orden en la cola, editable por el admin
+    position      INTEGER NOT NULL,       -- order in the queue, editable by the admin
     error         TEXT,
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
@@ -34,6 +34,6 @@ CREATE TABLE IF NOT EXISTS queue (
 
 CREATE INDEX IF NOT EXISTS idx_queue_state ON queue(state, position);
 
--- Invariante: nunca dos canciones sonando a la vez. La base lo hace cumplir
--- ademas del codigo.
+-- Invariant: never two songs playing at once. The database enforces it
+-- in addition to the code.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_one_playing ON queue(state) WHERE state = 'playing';

@@ -1,7 +1,7 @@
 {% if error %}
 <p class="rounded-2xl bg-red-950/60 border border-red-900 px-4 py-3 text-red-300">{{ error }}</p>
 {% elif not results %}
-<p class="text-neutral-500 py-2">Sin resultados{% if q %} para “{{ q }}”{% endif %}.</p>
+<p class="text-neutral-500 py-2">No results{% if q %} for “{{ q }}”{% endif %}.</p>
 {% endif %}
 {% for r in results %}
 <article class="flex items-center gap-3 rounded-2xl bg-neutral-900 p-2">
@@ -11,6 +11,6 @@
     <p class="text-sm text-neutral-400 truncate">{{ r.channel or "" }}{% if r.duration_s %} · {{ r.duration_s | mmss }}{% endif %}</p>
   </div>
   <button hx-post="/queue" hx-vals='{{ {"video_id": r.video_id} | tojson }}' hx-swap="outerHTML"
-          class="shrink-0 rounded-xl bg-fuchsia-600 active:bg-fuchsia-700 px-4 py-3 font-bold">Agregar</button>
+          class="shrink-0 rounded-xl bg-fuchsia-600 active:bg-fuchsia-700 px-4 py-3 font-bold">Add</button>
 </article>
 {% endfor %}

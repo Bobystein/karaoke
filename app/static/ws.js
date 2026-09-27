@@ -1,6 +1,6 @@
-// Conexion WebSocket compartida por la pantalla y los celulares.
-// Si se cae, reintenta cada 2 segundos sin recargar la pagina (para no
-// interrumpir el video en la pantalla).
+// WebSocket connection shared by the screen and the phones.
+// If it drops, it retries every 2 seconds without reloading the page (so the
+// video on the screen isn't interrupted).
 function connectWS(onMessage, onStatus) {
   const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
   let ws = null;

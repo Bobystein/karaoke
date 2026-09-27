@@ -1,25 +1,28 @@
-# Servidor del karaoke. Instalar con:
+# Karaoke server. Install with:
 #   sudo cp deploy/karaoke.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now karaoke
 [Unit]
-Description=Karaoke de coatl (FastAPI, puerto 8004)
+Description=coatl karaoke (FastAPI, port 8004)
 After=network-online.target
 Wants=network-online.target
+# The video library lives on this disk (KARAOKE_MEDIA_DIR). If it isn't
+# mounted, don't start: downloads would silently fill up the system disk.
+RequiresMountsFor=/mnt/media
 
 [Service]
 Type=simple
 User=rober
 Group=rober
 WorkingDirectory=/home/rober/karaoke
-# Contrasena de admin y datos del WiFi para el QR. Fuera de git.
+# Admin password and WiFi details for the QR code. Kept out of git.
 EnvironmentFile=/home/rober/karaoke/.env
-# Para que `pactl` (control de volumen) encuentre el audio de la sesion de rober.
+# So `pactl` (volume control) can find rober's session audio.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rober/karaoke/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8004
 Restart=on-failure
 RestartSec=3
-# Una descarga a medias puede tardar en soltar; al reiniciar vuelve a la cola.
+# A half-done download can take a while to let go; on restart it goes back to the queue.
 TimeoutStopSec=15
 NoNewPrivileges=true
 PrivateTmp=true

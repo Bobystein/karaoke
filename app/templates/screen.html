@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Karaoke · screen</title>
+  {# No CDN on purpose: the screen has to keep working if the internet goes down. #}
+  <style>
+    :root {
+      --bg: #07060b;
+      --fg: #f5f3ff;
+      --muted: #a39fb8;
+      --accent: #d946ef;
+      --accent2: #8b5cf6;
+      --ok: #34d399;
+      --info: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      cursor: none;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .layer {
+      position: fixed; inset: 0;
+      transition: opacity .8s ease;
+    }
+    .hidden { opacity: 0; pointer-events: none; }
+
+    /* --- QR codes (waiting screen and pause) --- */
+    .qrs { display: flex; gap: 7vw; align-items: flex-start; justify-content: center; }
+    .qr { display: flex; flex-direction: column; align-items: center; gap: 1.6vh; }
+    .qr .box {
+      width: min(34vh, 30vw); aspect-ratio: 1;
+      background: #fff; border-radius: 2.2vh; padding: 1.2vh;
+      box-shadow: 0 2vh 6vh rgba(0, 0, 0, .5);
+    }
+    .qr .box svg { width: 100%; height: 100%; display: block; }
+    .qr .box.empty {
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(255, 255, 255, .06); color: var(--muted); font-size: 2.2vh; padding: 3vh;
+    }
+    .qr .step { font-size: 3.4vh; font-weight: 800; }
+    .qr .detail { font-size: 2.4vh; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .instructions { font-size: 3vh; color: var(--muted); line-height: 1.5; }
+    .instructions strong { color: var(--fg); }
+
+    /* --- waiting mode --- */
+    #waiting {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 4vh;
+      background:
+        radial-gradient(ellipse at 20% 10%, rgba(217, 70, 239, .28), transparent 55%),
+        radial-gradient(ellipse at 85% 90%, rgba(139, 92, 246, .30), transparent 55%),
+        var(--bg);
+      padding: 4vh 4vw;
+      text-align: center;
+    }
+    #waiting h1 {
+      font-size: clamp(3rem, 11vh, 9rem);
+      font-weight: 900;
+      letter-spacing: -.03em;
+      line-height: 1;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+
+    #downloading { font-size: 2.8vh; color: var(--muted); min-height: 3vh; }
+    #downloading .heading { color: var(--info); font-weight: 700; margin-bottom: .8vh; }
+    #downloading ul { list-style: none; display: flex; flex-direction: column; gap: .6vh; }
+    #downloading .pct { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+    /* --- playing mode --- */
+    #playing { background: #000; }
+    #video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+
+    #bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      display: flex; align-items: stretch; gap: 3vw;
+      padding: 2.2vh 3vw 3.2vh;
+      background: linear-gradient(180deg, rgba(7, 6, 11, .94) 0%, rgba(7, 6, 11, .82) 75%, rgba(7, 6, 11, 0) 100%);
+      transform: translateY(-110%);
+      transition: transform .7s cubic-bezier(.2, .8, .2, 1);
+    }
+    #bar.visible { transform: translateY(0); }
+    #bar .now { flex: 1.6; min-width: 0; }
+    #bar .label { font-size: 1.7vh; text-transform: uppercase; letter-spacing: .2em; color: var(--accent); font-weight: 800; }
+    #bar .song { font-size: 3.6vh; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #bar .who { font-size: 2.4vh; color: var(--muted); }
+    #bar .next { flex: 1; min-width: 0; border-left: 2px solid rgba(255, 255, 255, .12); padding-left: 2.5vw; }
+    #bar .next .label { color: var(--muted); }
+    #bar ol { list-style: none; margin-top: .6vh; display: flex; flex-direction: column; gap: .5vh; }
+    #bar li { font-size: 2.3vh; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #bar li .who { font-size: 2.1vh; }
+    #bar li .status { font-size: 1.8vh; color: var(--info); }
+    #bar .join { flex: none; display: flex; align-items: center; gap: 1.2vw; }
+    #bar .join .box {
+      width: 13vh; aspect-ratio: 1;
+      background: #fff; border-radius: 1.2vh; padding: .6vh;
+    }
+    #bar .join .box svg { width: 100%; height: 100%; display: block; }
+    #bar .join .hint { font-size: 1.9vh; color: var(--muted); line-height: 1.35; text-align: right; }
+    #bar .join .hint strong { color: var(--fg); }
+
+    #notice {
+      position: absolute; inset: auto 0 9vh 0;
+      display: flex; justify-content: center;
+      transition: opacity .5s ease, transform .5s ease;
+    }
+    #notice.hidden { transform: translateY(3vh); }
+    #notice .card {
+      max-width: 80vw;
+      background: linear-gradient(90deg, rgba(217, 70, 239, .92), rgba(139, 92, 246, .92));
+      border-radius: 3vh; padding: 2.6vh 5vw; text-align: center;
+      box-shadow: 0 2vh 8vh rgba(0, 0, 0, .6);
+    }
+    #notice .label { font-size: 2.4vh; text-transform: uppercase; letter-spacing: .25em; font-weight: 700; opacity: .85; }
+    #notice .name { font-size: 7vh; font-weight: 900; line-height: 1.1; }
+    #notice .song { font-size: 3vh; opacity: .9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    #paused {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh;
+      background: rgba(7, 6, 11, .82); text-align: center; padding: 4vh 4vw;
+    }
+    #paused h2 { font-size: 8vh; font-weight: 900; letter-spacing: .1em; line-height: 1; }
+
+    #blocked {
+      position: fixed; inset: auto 2vw 2vh auto; max-width: 40vw;
+      background: #7f1d1d; color: #fff; border-radius: 1.5vh; padding: 1.5vh 2vw; font-size: 2vh;
+      cursor: pointer;
+    }
+    #connection {
+      position: fixed; right: 1.2vw; bottom: 1.2vh; width: 1.2vh; height: 1.2vh; border-radius: 50%;
+      background: #ef4444; transition: opacity .5s;
+    }
+    #connection.ok { opacity: 0; }
+  </style>
+</head>
+<body>
+
+{% macro join_qrs() %}
+  <div class="qrs">
+    <div class="qr">
+      {% if wifi_qr %}
+      <div class="box">{{ wifi_qr | safe }}</div>
+      {% else %}
+      <div class="box empty">KARAOKE_WIFI_SSID is not set</div>
+      {% endif %}
+      <div class="step">1 · Join the WiFi</div>
+      <div class="detail">{{ wifi_ssid }}</div>
+    </div>
+    <div class="qr">
+      <div class="box">{{ app_qr | safe }}</div>
+      <div class="step">2 · Open the karaoke</div>
+      <div class="detail">{{ app_url }}</div>
+    </div>
+  </div>
+{% endmacro %}
+
+<section id="waiting" class="layer">
+  <h1>Karaoke</h1>
+
+  {{ join_qrs() }}
+
+  <p class="instructions">
+    Scan the first code with your camera to join the WiFi and the second to open the app.<br>
+    <strong>Search for your song, add it to the queue</strong> and wait for your turn.
+  </p>
+
+  <div id="downloading"></div>
+</section>
+
+<section id="playing" class="layer hidden">
+  <video id="video" playsinline preload="auto" disablepictureinpicture></video>
+
+  <header id="bar">
+    <div class="now">
+      <div class="label">Now</div>
+      <div class="song" id="bar-title"></div>
+      <div class="who" id="bar-who"></div>
+    </div>
+    <div class="next">
+      <div class="label">Up next</div>
+      <ol id="bar-next"></ol>
+    </div>
+    <div class="join">
+      <div class="hint"><strong>Add a song</strong><br>scan to open<br>the karaoke</div>
+      <div class="box">{{ app_qr | safe }}</div>
+    </div>
+  </header>
+
+  <div id="notice" class="hidden">
+    <div class="card">
+      <div class="label">Up next</div>
+      <div class="name" id="notice-name"></div>
+      <div class="song" id="notice-song"></div>
+    </div>
+  </div>
+
+  <div id="paused" class="hidden">
+    <h2>PAUSED</h2>
+    {{ join_qrs() }}
+    <p class="instructions">
+      Lost the link or want to sing? <strong>Scan and add your song to the queue.</strong>
+    </p>
+  </div>
+</section>
+
+<div id="blocked" class="hidden">The browser blocked audio. Launch Chromium with --autoplay-policy=no-user-gesture-required (see README) or tap here.</div>
+<div id="connection"></div>
+
+<script src="/static/ws.js"></script>
+<script src="/static/screen.js"></script>
+</body>
+</html>

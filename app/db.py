@@ -1,4 +1,4 @@
-"""Conexion a SQLite y helpers de sessions y songs. Sin ORM."""
+"""SQLite connection and helpers for sessions and songs. No ORM."""
 
 import sqlite3
 import uuid
@@ -11,7 +11,7 @@ DEFAULT_DB_PATH = ROOT / "data" / "karaoke.db"
 
 
 def connect(path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    """Abre la base y aplica el esquema. Autocommit; las transacciones van con `transaction()`."""
+    """Opens the database and applies the schema. Autocommit; transactions go through `transaction()`."""
     if str(path) != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -62,7 +62,7 @@ def upsert_song(
     duration_s: int | None = None,
     thumb_url: str | None = None,
 ) -> None:
-    """Registra los metadatos de un video. No toca file_path ni play_count."""
+    """Records a video's metadata. Doesn't touch file_path or play_count."""
     conn.execute(
         """
         INSERT INTO songs (video_id, title, channel, duration_s, thumb_url)
@@ -90,7 +90,7 @@ def set_song_file(conn: sqlite3.Connection, video_id: str, file_path: str) -> No
 
 
 def cached_file(conn: sqlite3.Connection, video_id: str) -> str | None:
-    """Ruta del archivo si la cancion ya esta en cache y el archivo existe en disco."""
+    """File path if the song is cached and the file exists on disk."""
     song = get_song(conn, video_id)
     if song and song["file_path"] and Path(song["file_path"]).is_file():
         return song["file_path"]

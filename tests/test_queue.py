@@ -36,7 +36,7 @@ def admin(conn):
 
 
 def song(conn, vid):
-    db.upsert_song(conn, vid, f"Cancion {vid}", "Canal", 200, None)
+    db.upsert_song(conn, vid, f"Song {vid}", "Channel", 200, None)
     return vid
 
 
@@ -56,7 +56,7 @@ def playing_count(conn):
     return conn.execute("SELECT COUNT(*) FROM queue WHERE state = 'playing'").fetchone()[0]
 
 
-# --- invariante: una sola sonando ------------------------------------------
+# --- invariant: only one playing --------------------------------------------
 
 def test_never_two_playing(conn, q, ana, tmp_path):
     for v in "abcd":
@@ -64,7 +64,7 @@ def test_never_two_playing(conn, q, ana, tmp_path):
         q.add(v, ana)
     q.start_if_idle()
     assert playing_count(conn) == 1
-    # start_if_idle con algo sonando no arranca otra
+    # start_if_idle with something playing doesn't start another
     assert q.start_if_idle() is None
     assert playing_count(conn) == 1
     for _ in range(6):
@@ -98,12 +98,12 @@ def test_stale_ended_is_ignored(conn, q, ana, tmp_path):
     b = q.add("b", ana)
     q.start_if_idle()
     assert q.advance(expected_id=a["id"])["id"] == b["id"]
-    # un segundo `ended` de la cancion a no debe saltarse la b
+    # a second `ended` for song a must not skip b
     assert q.advance(expected_id=a["id"]) is None
     assert q.current()["id"] == b["id"]
 
 
-# --- regla de avance ---------------------------------------------------------
+# --- advance rule ------------------------------------------------------------
 
 def test_skips_downloading_and_keeps_position(conn, q, ana, tmp_path):
     cached_song(conn, "a", tmp_path)
@@ -118,11 +118,11 @@ def test_skips_downloading_and_keeps_position(conn, q, ana, tmp_path):
     q.start_if_idle()
     assert q.current()["id"] == a["id"]
     nxt = q.advance()
-    assert nxt["id"] == c["id"]  # se salto la b que sigue bajando
+    assert nxt["id"] == c["id"]  # skipped b, which is still downloading
     b_now = q.get(b["id"])
     assert b_now["state"] == "downloading"
     assert b_now["position"] == b["position"]
-    assert q.pending()[0]["id"] == b["id"]  # sigue siendo la primera de la cola
+    assert q.pending()[0]["id"] == b["id"]  # still first in the queue
 
     f = tmp_path / "b.mp4"
     f.write_bytes(b"x")
@@ -133,7 +133,7 @@ def test_skips_downloading_and_keeps_position(conn, q, ana, tmp_path):
 def test_empty_queue_goes_to_waiting(q):
     assert q.advance() is None
     snap = q.snapshot()
-    assert snap["mode"] == "espera"
+    assert snap["mode"] == "waiting"
     assert snap["current"] is None
 
 
@@ -144,10 +144,10 @@ def test_nothing_ready_goes_to_waiting(conn, q, ana, tmp_path):
     q.add("b", ana)
     q.claim_downloads()
     q.start_if_idle()
-    assert q.snapshot()["mode"] == "reproduccion"
+    assert q.snapshot()["mode"] == "playing"
     assert q.advance() is None
     snap = q.snapshot()
-    assert snap["mode"] == "espera"
+    assert snap["mode"] == "waiting"
     assert [i["video_id"] for i in snap["queue"]] == ["b"]
     assert snap["queue"][0]["state"] == "downloading"
 
@@ -176,7 +176,7 @@ def test_screen_error_fails_and_advances(conn, q, ana, tmp_path):
     assert failed["error"] == "MEDIA_ERR_DECODE"
 
 
-# --- cache y descargas -------------------------------------------------------
+# --- cache and downloads -----------------------------------------------------
 
 def test_cached_song_goes_straight_to_ready(conn, q, ana, tmp_path):
     cached_song(conn, "a", tmp_path)
@@ -187,7 +187,7 @@ def test_cached_song_goes_straight_to_ready(conn, q, ana, tmp_path):
 
 def test_cache_entry_without_file_is_not_cached(conn, q, ana, tmp_path):
     song(conn, "a")
-    db.set_song_file(conn, "a", str(tmp_path / "borrado.mp4"))
+    db.set_song_file(conn, "a", str(tmp_path / "deleted.mp4"))
     assert q.add("a", ana)["state"] == "queued"
 
 
@@ -197,7 +197,7 @@ def test_at_most_two_downloads(conn, q, ana):
         q.add(v, ana)
     assert q.claim_downloads() == ["a", "b"]
     assert q.claim_downloads() == []
-    q.mark_download_failed("a", "sin red")
+    q.mark_download_failed("a", "no network")
     assert q.claim_downloads() == ["c"]
     assert states(q) == {"a": "failed", "b": "downloading", "c": "downloading", "d": "queued"}
 
@@ -219,10 +219,10 @@ def test_download_failure_keeps_reason(conn, q, ana):
     song(conn, "a")
     item = q.add("a", ana)
     q.claim_downloads()
-    q.mark_download_failed("a", "formato no reproducible: vp9")
+    q.mark_download_failed("a", "format not playable: vp9")
     got = q.get(item["id"])
     assert got["state"] == "failed"
-    assert got["error"] == "formato no reproducible: vp9"
+    assert got["error"] == "format not playable: vp9"
     assert q.snapshot()["failed"][0]["id"] == item["id"]
 
 
@@ -240,13 +240,13 @@ def test_unknown_song_rejected(q, ana):
         q.add("nope", ana)
 
 
-# --- quitar, permisos, reordenar, vaciar ------------------------------------
+# --- remove, permissions, reorder, clear -------------------------------------
 
 def test_user_removes_own(conn, q, ana):
     song(conn, "a")
     item = q.add("a", ana)
     q.remove(item["id"], ana)
-    assert q.get(item["id"])["state"] == "removed"  # no se borra el renglon
+    assert q.get(item["id"])["state"] == "removed"  # the row isn't deleted
 
 
 def test_user_cannot_remove_others(conn, q, ana, beto):

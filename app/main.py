@@ -1,10 +1,10 @@
-"""Rutas HTTP y WebSocket. Ver SPEC.md, secciones 7 a 9.
+"""HTTP and WebSocket routes. See SPEC.md, sections 7 to 9.
 
-Toda la orquestacion vive aqui: el estado esta en SQLite (app/queue.py), las
-descargas corren en hilos (asyncio.to_thread) y a la base solo se le habla
-desde el loop de asyncio. Todo cambio termina en `changed()`, que arranca
-descargas pendientes, arranca la siguiente si la pantalla esta libre y
-transmite el estado completo a todos los clientes.
+All orchestration lives here: state is in SQLite (app/queue.py), downloads
+run in threads (asyncio.to_thread) and the database is only touched from the
+asyncio loop. Every change ends in `changed()`, which starts pending
+downloads, starts the next song if the screen is free and broadcasts the
+full state to every client.
 """
 
 import asyncio
@@ -48,7 +48,7 @@ def mmss(seconds: int | None) -> str:
 templates.env.filters["mmss"] = mmss
 
 
-# --- configuracion ----------------------------------------------------------
+# --- configuration ----------------------------------------------------------
 
 @dataclass
 class Config:
@@ -58,13 +58,15 @@ class Config:
     wifi_ssid: str = ""
     wifi_password: str = ""
     port: int = PORT
-    # Solo la pantalla (Chromium en esta misma maquina) puede mandar `ended`
-    # y `error` por el WebSocket. Un celular no puede saltarse canciones asi.
+    # Only the screen (Chromium on this same machine) may send `ended` and
+    # `error` over the WebSocket, so a phone can't skip songs that way.
     screen_hosts: frozenset = field(default_factory=lambda: frozenset({"127.0.0.1", "::1"}))
 
     @classmethod
     def from_env(cls) -> "Config":
+        media_dir = os.environ.get("KARAOKE_MEDIA_DIR")
         return cls(
+            media_dir=Path(media_dir) if media_dir else downloader.DEFAULT_MEDIA_DIR,
             admin_password=os.environ.get("KARAOKE_ADMIN_PASSWORD", ""),
             wifi_ssid=os.environ.get("KARAOKE_WIFI_SSID", ""),
             wifi_password=os.environ.get("KARAOKE_WIFI_PASSWORD", ""),
@@ -74,7 +76,7 @@ class Config:
 # --- QR ---------------------------------------------------------------------
 
 def wifi_escape(value: str) -> str:
-    """Escapa los caracteres especiales del formato WIFI: (\\ ; , : ")."""
+    """Escapes the WIFI format's special characters: (\\ ; , : ")."""
     return re.sub(r'([\\;,:"])', r"\\\1", value)
 
 
@@ -85,12 +87,12 @@ def wifi_payload(ssid: str, password: str) -> str:
 
 
 def qr_svg(data: str) -> str:
-    """SVG en linea, sin width/height fijos para que el CSS lo dimensione."""
+    """Inline SVG without fixed width/height, so CSS can size it."""
     return segno.make(data, error="m").svg_inline(scale=10, border=2, omitsize=True)
 
 
 def detect_lan_ip() -> str:
-    """IP de la interfaz con la ruta por defecto. Un connect UDP no manda paquetes."""
+    """IP of the interface with the default route. A UDP connect sends no packets."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.connect(("8.8.8.8", 80))
@@ -100,10 +102,10 @@ def detect_lan_ip() -> str:
 
 
 def owner_tag(session_id: str | None) -> str | None:
-    """Identificador publico del dueno de una peticion.
+    """Public identifier of a request's owner.
 
-    El id de sesion es la credencial (va en la cookie), asi que nunca se
-    transmite: los clientes reciben este hash para saber cuales son suyas.
+    The session id is the credential (it lives in the cookie), so it is never
+    broadcast: clients get this hash to tell which requests are theirs.
     """
     if not session_id:
         return None
@@ -111,11 +113,11 @@ def owner_tag(session_id: str | None) -> str | None:
 
 
 def run_pactl(args: list[str]) -> None:
-    """Llama pactl con argumentos fijos (lista, sin shell)."""
+    """Runs pactl with fixed arguments (a list, no shell)."""
     subprocess.run(["pactl", *args], check=True, capture_output=True, timeout=5)
 
 
-# --- estado de la app -------------------------------------------------------
+# --- app state --------------------------------------------------------------
 
 class Karaoke:
     def __init__(self, cfg: Config):
@@ -124,8 +126,8 @@ class Karaoke:
         self.queue: Queue | None = None
         self.clients: set[WebSocket] = set()
         self.progress: dict[str, float] = {}
-        # Id de la peticion pausada. La pausa solo vale para esa cancion: si
-        # cambia la actual, la nueva arranca sonando sin logica extra.
+        # Id of the paused request. The pause only applies to that song: if
+        # the current one changes, the new one starts playing with no extra logic.
         self.paused_id: int | None = None
         self.search_cache: OrderedDict[str, dict] = OrderedDict()
         self.tasks: set[asyncio.Task] = set()
@@ -165,7 +167,7 @@ class Karaoke:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    # --- estado y broadcast ---
+    # --- state and broadcast ---
 
     def state_message(self) -> dict:
         snap = self.queue.snapshot()
@@ -203,7 +205,7 @@ class Karaoke:
         self.queue.start_if_idle()
         await self.broadcast(self.state_message())
 
-    # --- descargas ---
+    # --- downloads ---
 
     def pump(self) -> None:
         for vid in self.queue.claim_downloads():
@@ -214,7 +216,7 @@ class Karaoke:
         loop = asyncio.get_running_loop()
         last = [-100.0]
 
-        def on_progress(pct: float) -> None:  # corre en el hilo de descarga
+        def on_progress(pct: float) -> None:  # runs in the download thread
             if pct - last[0] >= 2 or pct >= 100:
                 last[0] = pct
                 loop.call_soon_threadsafe(self._on_progress, video_id, pct)
@@ -226,7 +228,7 @@ class Karaoke:
         except downloader.DownloadError as e:
             self.queue.mark_download_failed(video_id, str(e))
         except Exception as e:
-            self.queue.mark_download_failed(video_id, f"error inesperado: {e}")
+            self.queue.mark_download_failed(video_id, f"unexpected error: {e}")
         else:
             self.queue.mark_downloaded(video_id, res["file_path"])
         finally:
@@ -239,7 +241,7 @@ class Karaoke:
         self.progress[video_id] = pct
         self._spawn(self.broadcast({"type": "progress", "video_id": video_id, "pct": pct}))
 
-    # --- busqueda ---
+    # --- search ---
 
     def remember_results(self, results: list[dict]) -> None:
         for r in results:
@@ -266,28 +268,28 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.k = k
     app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 
-    # --- sesiones y permisos ---
+    # --- sessions and permissions ---
 
     def get_session(request: Request) -> dict | None:
         return db.get_session(k.conn, request.cookies.get(COOKIE))
 
     def require_session(session=Depends(get_session)) -> dict:
         if session is None:
-            raise HTTPException(401, "primero escribe tu nombre")
+            raise HTTPException(401, "enter your name first")
         return session
 
     def require_admin(session=Depends(require_session)) -> dict:
         if not session["is_admin"]:
-            raise HTTPException(403, "solo admin")
+            raise HTTPException(403, "admin only")
         return session
 
-    # --- vistas ---
+    # --- views ---
 
     @app.get("/", response_class=HTMLResponse)
-    async def movil(request: Request, session=Depends(get_session)):
+    async def mobile(request: Request, session=Depends(get_session)):
         return templates.TemplateResponse(
             request,
-            "movil.html",
+            "mobile.html",
             {
                 "session": session,
                 "owner": owner_tag(session["id"]) if session else None,
@@ -301,8 +303,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not name:
             return templates.TemplateResponse(
                 request,
-                "movil.html",
-                {"session": None, "owner": None, "error": "Escribe tu nombre"},
+                "mobile.html",
+                {"session": None, "owner": None, "error": "Enter your name"},
                 status_code=400,
             )
         session = db.create_session(k.conn, name)
@@ -312,11 +314,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         )
         return resp
 
-    @app.get("/pantalla", response_class=HTMLResponse)
-    async def pantalla(request: Request):
+    @app.get("/screen", response_class=HTMLResponse)
+    async def screen(request: Request):
         return templates.TemplateResponse(
             request,
-            "pantalla.html",
+            "screen.html",
             {
                 "wifi_qr": k.wifi_qr,
                 "wifi_ssid": cfg.wifi_ssid,
@@ -325,10 +327,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             },
         )
 
-    # --- busqueda y cola ---
+    # --- search and queue ---
 
-    @app.get("/buscar", response_class=HTMLResponse)
-    async def buscar(request: Request, q: str = "", karaoke: int = 0, session=Depends(require_session)):
+    @app.get("/search", response_class=HTMLResponse)
+    async def search(request: Request, q: str = "", karaoke: int = 0, session=Depends(require_session)):
         error = None
         results: list[dict] = []
         try:
@@ -337,26 +339,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             error = str(e)
         k.remember_results(results)
         return templates.TemplateResponse(
-            request, "partials/resultados.html", {"results": results, "error": error, "q": q}
+            request, "partials/results.html", {"results": results, "error": error, "q": q}
         )
 
     @app.post("/queue")
     async def add_to_queue(video_id: str = Form(...), session=Depends(require_session)):
         if not downloader.is_valid_video_id(video_id):
-            raise HTTPException(400, "id de video invalido")
-        # Solo se aceptan videos que salieron en una busqueda o ya estan en
-        # la biblioteca, para no confiar en metadatos que mande el cliente.
+            raise HTTPException(400, "invalid video id")
+        # Only videos that came up in a search or are already in the library
+        # are accepted, so we never trust metadata sent by the client.
         meta = k.search_cache.get(video_id)
         if meta is not None:
             db.upsert_song(
                 k.conn, video_id, meta["title"], meta["channel"], meta["duration_s"], meta["thumb_url"]
             )
         elif db.get_song(k.conn, video_id) is None:
-            raise HTTPException(404, "busca la cancion de nuevo")
+            raise HTTPException(404, "search for the song again")
         item = k.queue.add(video_id, session)
         await k.changed()
         return HTMLResponse(
-            '<span class="shrink-0 px-3 py-3 font-bold text-emerald-400">En la cola ✓</span>',
+            '<span class="shrink-0 px-3 py-3 font-bold text-emerald-400">Queued ✓</span>',
             status_code=201,
             headers={"X-Queue-Id": str(item["id"])},
         )
@@ -386,10 +388,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/admin/login")
     async def admin_login(password: str = Form(""), session=Depends(require_session)):
         if not cfg.admin_password:
-            raise HTTPException(503, "admin deshabilitado: falta KARAOKE_ADMIN_PASSWORD")
+            raise HTTPException(503, "admin disabled: KARAOKE_ADMIN_PASSWORD is not set")
         if not hmac.compare_digest(password.encode(), cfg.admin_password.encode()):
-            await asyncio.sleep(1)  # frena intentos a fuerza bruta
-            raise HTTPException(403, "contrasena incorrecta")
+            await asyncio.sleep(1)  # slows down brute-force attempts
+            raise HTTPException(403, "wrong password")
         db.set_admin(k.conn, session["id"])
         return JSONResponse({"ok": True}, headers={"HX-Refresh": "true"})
 
@@ -418,7 +420,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             try:
                 ids = [int(x) for x in order.split(",") if x.strip()]
             except ValueError:
-                raise HTTPException(400, "order debe ser una lista de ids separados por coma")
+                raise HTTPException(400, "order must be a comma-separated list of ids")
             k.queue.reorder(ids)
         elif id is not None and delta is not None:
             try:
@@ -426,7 +428,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             except NotFound as e:
                 raise HTTPException(404, str(e))
         else:
-            raise HTTPException(400, "manda order, o id y delta")
+            raise HTTPException(400, "send order, or id and delta")
         await k.changed()
         return {"ok": True}
 
@@ -444,18 +446,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     ):
         if level is not None:
             if not 0 <= level <= 150:
-                raise HTTPException(400, "level va de 0 a 150")
+                raise HTTPException(400, "level must be between 0 and 150")
             arg = f"{level}%"
         elif delta is not None:
             if not -50 <= delta <= 50 or delta == 0:
-                raise HTTPException(400, "delta va de -50 a 50")
+                raise HTTPException(400, "delta must be between -50 and 50")
             arg = f"{delta:+d}%"
         else:
-            raise HTTPException(400, "manda level o delta")
+            raise HTTPException(400, "send level or delta")
         try:
             await asyncio.to_thread(run_pactl, ["set-sink-volume", "@DEFAULT_SINK@", arg])
         except (subprocess.SubprocessError, OSError) as e:
-            raise HTTPException(502, f"pactl fallo: {e}")
+            raise HTTPException(502, f"pactl failed: {e}")
         return {"ok": True, "volume": arg}
 
     # --- WebSocket ---
@@ -478,11 +480,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     continue
                 current = k.queue.current()
                 if current is None or current["id"] != item_id:
-                    continue  # aviso repetido o tardio de una cancion que ya no suena
+                    continue  # repeated or late report for a song that is no longer playing
                 if kind == "ended":
                     k.queue.advance(expected_id=item_id)
                 elif kind == "error":
-                    reason = str(msg.get("error") or "el video no se pudo reproducir")[:300]
+                    reason = str(msg.get("error") or "the video could not be played")[:300]
                     k.queue.fail_current(reason, expected_id=item_id)
                 else:
                     continue

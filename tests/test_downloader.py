@@ -1,4 +1,4 @@
-"""Tests del downloader. Nunca llaman a YouTube: YoutubeDL se simula."""
+"""Downloader tests. They never call YouTube: YoutubeDL is faked."""
 
 import pytest
 import yt_dlp
@@ -8,7 +8,7 @@ from app.downloader import DownloadError
 
 
 class FakeYDL:
-    """Imita la parte de YoutubeDL que usamos. Registra las llamadas."""
+    """Mimics the part of YoutubeDL we use. Records the calls."""
 
     calls: list = []
     search_result: dict = {}
@@ -73,14 +73,14 @@ H264 = {
 }
 
 
-# --- busqueda ---------------------------------------------------------------
+# --- search -----------------------------------------------------------------
 
 def test_search_adds_karaoke_and_parses(fake_ydl):
     fake_ydl.search_result = {
         "entries": [
-            {"id": VID, "title": "Cielito lindo", "channel": "Canal", "duration": 190.0},
-            {"id": "aaaaaaaaaaa", "title": "Recopilacion 2 horas", "duration": 7200},
-            {"id": "UCxxxxxxxxxxxxxxxxxxxxxx", "title": "Un canal"},
+            {"id": VID, "title": "Cielito lindo", "channel": "Channel", "duration": 190.0},
+            {"id": "aaaaaaaaaaa", "title": "2-hour compilation", "duration": 7200},
+            {"id": "UCxxxxxxxxxxxxxxxxxxxxxx", "title": "A channel"},
             None,
         ]
     }
@@ -90,7 +90,7 @@ def test_search_adds_karaoke_and_parses(fake_ydl):
         {
             "video_id": VID,
             "title": "Cielito lindo",
-            "channel": "Canal",
+            "channel": "Channel",
             "duration_s": 190,
             "thumb_url": f"https://i.ytimg.com/vi/{VID}/mqdefault.jpg",
         }
@@ -124,12 +124,12 @@ def test_search_query_is_truncated(fake_ydl):
 
 
 def test_search_error_becomes_download_error(fake_ydl):
-    fake_ydl.raise_on_extract = yt_dlp.utils.DownloadError("ERROR: sin red")
-    with pytest.raises(DownloadError, match="sin red"):
+    fake_ydl.raise_on_extract = yt_dlp.utils.DownloadError("ERROR: no network")
+    with pytest.raises(DownloadError, match="no network"):
         downloader.search("x")
 
 
-# --- descarga ---------------------------------------------------------------
+# --- download ---------------------------------------------------------------
 
 def test_download_h264(fake_ydl, tmp_path):
     fake_ydl.video_info = H264
@@ -145,7 +145,7 @@ def test_download_h264(fake_ydl, tmp_path):
 
 
 def test_download_uses_cache(fake_ydl, tmp_path):
-    (tmp_path / f"{VID}.mp4").write_bytes(b"ya estaba")
+    (tmp_path / f"{VID}.mp4").write_bytes(b"already here")
     res = downloader.download(VID, tmp_path)
     assert res["cached"] is True
     assert fake_ydl.calls == []
@@ -167,31 +167,31 @@ def test_download_single_file_fallback_ok(fake_ydl, tmp_path):
 )
 def test_download_rejects_unplayable_before_downloading(fake_ydl, tmp_path, info):
     fake_ydl.video_info = info
-    with pytest.raises(DownloadError, match="no reproducible"):
+    with pytest.raises(DownloadError, match="not playable"):
         downloader.download(VID, tmp_path)
     assert not any(c[0] == "process_ie_result" for c in fake_ydl.calls)
     assert list(tmp_path.iterdir()) == []
 
 
 def test_download_failure_cleans_partials_keeps_nothing_else(fake_ydl, tmp_path):
-    (tmp_path / f"{VID}.f137.mp4.part").write_bytes(b"medio")
-    (tmp_path / "otroVideo01.mp4").write_bytes(b"cache ajeno")
+    (tmp_path / f"{VID}.f137.mp4.part").write_bytes(b"half")
+    (tmp_path / "otherVideo1.mp4").write_bytes(b"other cache")
     fake_ydl.raise_on_extract = yt_dlp.utils.DownloadError("ERROR: \x1b[0;31mVideo unavailable\x1b[0m")
     with pytest.raises(DownloadError) as exc:
         downloader.download(VID, tmp_path)
     assert str(exc.value) == "Video unavailable"
-    assert [p.name for p in tmp_path.iterdir()] == ["otroVideo01.mp4"]
+    assert [p.name for p in tmp_path.iterdir()] == ["otherVideo1.mp4"]
 
 
 def test_download_missing_output_is_failure(fake_ydl, tmp_path):
     fake_ydl.video_info = H264
     fake_ydl.write_file = False
-    with pytest.raises(DownloadError, match="no dejo"):
+    with pytest.raises(DownloadError, match="left no"):
         downloader.download(VID, tmp_path)
 
 
 @pytest.mark.parametrize("bad", ["../../etc/pa", "abc", "a" * 12, "abc def ghi", ""])
 def test_invalid_video_id_rejected(fake_ydl, tmp_path, bad):
-    with pytest.raises(DownloadError, match="invalido"):
+    with pytest.raises(DownloadError, match="invalid"):
         downloader.download(bad, tmp_path)
     assert fake_ydl.calls == []
