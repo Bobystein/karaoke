@@ -19,7 +19,36 @@ def connect(path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA_PATH.read_text())
+    migrate(conn)
     return conn
+
+
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS doesn't
+# touch an existing table, so they are added here, with an optional statement
+# that fills them in for the rows that already existed.
+ADDED_COLUMNS = {
+    "queue": [("query", "TEXT", None), ("search_mode", "TEXT", None)],
+    "songs": [
+        (
+            "last_used_at",
+            "TEXT",
+            """UPDATE songs SET last_used_at = COALESCE(
+                   (SELECT MAX(COALESCE(q.played_at, q.added_at)) FROM queue q
+                    WHERE q.video_id = songs.video_id),
+                   downloaded_at)""",
+        ),
+    ],
+}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl, backfill in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                if backfill:
+                    conn.execute(backfill)
 
 
 @contextmanager
@@ -48,8 +77,35 @@ def get_session(conn: sqlite3.Connection, session_id: str | None) -> dict | None
     return dict(row) if row else None
 
 
+def rename_session(conn: sqlite3.Connection, session_id: str, name: str) -> None:
+    """Changes the name, also on the requests still in the queue (or failed), so
+    everyone sees the new one. Songs already played keep the name they had."""
+    with transaction(conn):
+        conn.execute("UPDATE sessions SET name = ? WHERE id = ?", (name, session_id))
+        conn.execute(
+            "UPDATE queue SET requested_by = ? WHERE session_id = ? "
+            "AND state IN ('queued','downloading','ready','playing','failed')",
+            (name, session_id),
+        )
+
+
 def set_admin(conn: sqlite3.Connection, session_id: str) -> None:
     conn.execute("UPDATE sessions SET is_admin = 1 WHERE id = ?", (session_id,))
+
+
+# --- settings ---------------------------------------------------------------
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 # --- songs ------------------------------------------------------------------
@@ -80,6 +136,18 @@ def upsert_song(
 def get_song(conn: sqlite3.Connection, video_id: str) -> dict | None:
     row = conn.execute("SELECT * FROM songs WHERE video_id = ?", (video_id,)).fetchone()
     return dict(row) if row else None
+
+
+def touch_song(conn: sqlite3.Connection, video_id: str) -> None:
+    """Marks the song as just used (requested or played), for the library's eviction order."""
+    conn.execute("UPDATE songs SET last_used_at = datetime('now') WHERE video_id = ?", (video_id,))
+
+
+def forget_file(conn: sqlite3.Connection, video_id: str) -> None:
+    """The file was deleted: the song stays (metadata, play count) but isn't cached anymore."""
+    conn.execute(
+        "UPDATE songs SET file_path = NULL, downloaded_at = NULL WHERE video_id = ?", (video_id,)
+    )
 
 
 def set_song_file(conn: sqlite3.Connection, video_id: str, file_path: str) -> None:

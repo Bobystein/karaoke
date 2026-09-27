@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import socket
@@ -26,8 +27,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app import db, downloader
+from app import db, downloader, library
 from app.queue import Forbidden, NotFound, Queue
+
+log = logging.getLogger(__name__)
 
 APP_DIR = Path(__file__).resolve().parent
 PORT = 8004
@@ -54,7 +57,11 @@ templates.env.filters["mmss"] = mmss
 class Config:
     db_path: Path = db.DEFAULT_DB_PATH
     media_dir: Path = downloader.DEFAULT_MEDIA_DIR
+    # Size limit of the video library; the least recently used go first. 0 = no limit.
+    media_max_bytes: int = library.DEFAULT_MAX_GB * library.GB
     admin_password: str = ""
+    # A second, independent password (e.g. for someone else to use as admin).
+    admin_password_2: str = ""
     wifi_ssid: str = ""
     wifi_password: str = ""
     port: int = PORT
@@ -62,15 +69,37 @@ class Config:
     # `error` over the WebSocket, so a phone can't skip songs that way.
     screen_hosts: frozenset = field(default_factory=lambda: frozenset({"127.0.0.1", "::1"}))
 
+    @property
+    def admin_passwords(self) -> list[str]:
+        """The admin passwords that are set. Empty = admin mode disabled."""
+        return [p for p in (self.admin_password, self.admin_password_2) if p]
+
     @classmethod
     def from_env(cls) -> "Config":
         media_dir = os.environ.get("KARAOKE_MEDIA_DIR")
         return cls(
             media_dir=Path(media_dir) if media_dir else downloader.DEFAULT_MEDIA_DIR,
+            media_max_bytes=parse_max_gb(os.environ.get("KARAOKE_MEDIA_MAX_GB", "")),
             admin_password=os.environ.get("KARAOKE_ADMIN_PASSWORD", ""),
+            admin_password_2=os.environ.get("KARAOKE_ADMIN_PASSWORD_2", ""),
             wifi_ssid=os.environ.get("KARAOKE_WIFI_SSID", ""),
             wifi_password=os.environ.get("KARAOKE_WIFI_PASSWORD", ""),
         )
+
+
+def parse_max_gb(value: str) -> int:
+    """KARAOKE_MEDIA_MAX_GB in bytes. Empty or invalid = the default; 0 = no limit."""
+    value = value.strip()
+    if not value:
+        return library.DEFAULT_MAX_GB * library.GB
+    try:
+        gb = float(value)
+        if gb < 0 or gb != gb:  # negative or NaN
+            raise ValueError
+    except ValueError:
+        log.warning("KARAOKE_MEDIA_MAX_GB=%r isn't a number of GB; using %d", value, library.DEFAULT_MAX_GB)
+        return library.DEFAULT_MAX_GB * library.GB
+    return int(gb * library.GB)
 
 
 # --- QR ---------------------------------------------------------------------
@@ -141,6 +170,7 @@ class Karaoke:
         self.queue = Queue(self.conn)
         self.queue.recover()
         Path(self.cfg.media_dir).mkdir(parents=True, exist_ok=True)
+        self.trim_library()  # in case the limit was lowered
         self.lan_ip = detect_lan_ip()
         self.app_url = f"http://{self.lan_ip}:{self.cfg.port}"
         self.app_qr = qr_svg(self.app_url)
@@ -156,11 +186,23 @@ class Karaoke:
         current = self.queue.current()
         self.paused_id = current["id"] if (paused and current) else None
 
+    @property
+    def qr_pinned(self) -> bool:
+        """The app's QR stays in the screen's corner while a song plays."""
+        return db.get_setting(self.conn, "qr_pinned") == "1"
+
+    def set_qr_pinned(self, pinned: bool) -> None:
+        db.set_setting(self.conn, "qr_pinned", "1" if pinned else "0")
+
     def stop(self) -> None:
         for t in self.tasks:
             t.cancel()
         if self.conn is not None:
             self.conn.close()
+
+    def trim_library(self) -> None:
+        with self.queue.lock:
+            library.enforce_limit(self.conn, self.cfg.media_dir, self.cfg.media_max_bytes)
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -189,6 +231,7 @@ class Karaoke:
             "next_ready": public(snap["next_ready"]),
             "failed": [public(i) for i in snap["failed"]],
             "paused": self.paused,
+            "qr_pinned": self.qr_pinned,
         }
 
     async def broadcast(self, msg: dict) -> None:
@@ -227,10 +270,13 @@ class Karaoke:
             )
         except downloader.DownloadError as e:
             self.queue.mark_download_failed(video_id, str(e))
-        except Exception as e:
-            self.queue.mark_download_failed(video_id, f"unexpected error: {e}")
+        except Exception:
+            log.exception("download %s failed", video_id)
+            self.queue.mark_download_failed(video_id, downloader.MESSAGES["other"])
         else:
             self.queue.mark_downloaded(video_id, res["file_path"])
+            if not res.get("cached"):
+                self.trim_library()
         finally:
             self.progress.pop(video_id, None)
         await self.changed()
@@ -293,13 +339,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             {
                 "session": session,
                 "owner": owner_tag(session["id"]) if session else None,
-                "admin_enabled": bool(cfg.admin_password),
+                "admin_enabled": bool(cfg.admin_passwords),
             },
         )
 
+    def clean_name(name: str) -> str:
+        return " ".join(name.split())[:MAX_NAME_LEN]
+
     @app.post("/session")
     async def create_session(request: Request, name: str = Form("")):
-        name = " ".join(name.split())[:MAX_NAME_LEN]
+        name = clean_name(name)
         if not name:
             return templates.TemplateResponse(
                 request,
@@ -313,6 +362,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             COOKIE, session["id"], max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax"
         )
         return resp
+
+    @app.post("/session/name")
+    async def rename_session(name: str = Form(""), session=Depends(require_session)):
+        name = clean_name(name)
+        if not name:
+            raise HTTPException(400, "Enter your name")
+        db.rename_session(k.conn, session["id"], name)
+        await k.changed()
+        return {"ok": True, "name": name}
+
+    @app.post("/party/new")
+    async def new_party(request: Request):
+        """Called by kiosk.sh when it opens the screen for a new party. Only
+        from this machine: a phone can't wipe the queue."""
+        if request.client is None or request.client.host not in cfg.screen_hosts:
+            raise HTTPException(403, "only from the karaoke machine")
+        k.queue.new_party()
+        k.paused_id = None
+        await k.changed()
+        return {"ok": True}
 
     @app.get("/screen", response_class=HTMLResponse)
     async def screen(request: Request):
@@ -330,20 +399,54 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # --- search and queue ---
 
     @app.get("/search", response_class=HTMLResponse)
-    async def search(request: Request, q: str = "", karaoke: int = 0, session=Depends(require_session)):
+    async def search(
+        request: Request,
+        q: str = "",
+        mode: str = downloader.DEFAULT_MODE,
+        failed: str = "",
+        session=Depends(require_session),
+    ):
+        mode = downloader.normalize_mode(mode)
         error = None
         results: list[dict] = []
+        link_id = downloader.parse_video_ref(q)
         try:
-            results = await asyncio.to_thread(downloader.search, q, bool(karaoke))
+            if link_id is not None:
+                try:
+                    results = [await asyncio.to_thread(downloader.resolve, link_id)]
+                except downloader.TooLong:
+                    raise
+                except downloader.DownloadError:
+                    # A bare 11-character word ("Bittersweet") looks like an
+                    # id; if it isn't a video, it was a search after all.
+                    if q.strip() != link_id:
+                        raise
+                    link_id = None
+            if link_id is None:
+                results = await asyncio.to_thread(downloader.search, q, mode)
         except downloader.DownloadError as e:
             error = str(e)
         k.remember_results(results)
         return templates.TemplateResponse(
-            request, "partials/results.html", {"results": results, "error": error, "q": q}
+            request,
+            "partials/results.html",
+            {
+                "results": results,
+                "error": error,
+                "q": q,
+                "mode": mode,
+                "is_link": link_id is not None,
+                "failed": failed if downloader.is_valid_video_id(failed) else None,
+            },
         )
 
     @app.post("/queue")
-    async def add_to_queue(video_id: str = Form(...), session=Depends(require_session)):
+    async def add_to_queue(
+        video_id: str = Form(...),
+        q: str = Form(""),
+        mode: str = Form(downloader.DEFAULT_MODE),
+        session=Depends(require_session),
+    ):
         if not downloader.is_valid_video_id(video_id):
             raise HTTPException(400, "invalid video id")
         # Only videos that came up in a search or are already in the library
@@ -355,7 +458,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             )
         elif db.get_song(k.conn, video_id) is None:
             raise HTTPException(404, "search for the song again")
-        item = k.queue.add(video_id, session)
+        # Remembered for "try another version". A pasted link isn't worth
+        # repeating (it gives the same video): the phone falls back to the title.
+        query = " ".join(q.split())[: downloader.MAX_QUERY_LEN]
+        if not query or downloader.parse_video_ref(query):
+            query = None
+        item = k.queue.add(video_id, session, query, downloader.normalize_mode(mode))
         await k.changed()
         return HTMLResponse(
             '<span class="shrink-0 px-3 py-3 font-bold text-emerald-400">Queued ✓</span>',
@@ -387,9 +495,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.post("/admin/login")
     async def admin_login(password: str = Form(""), session=Depends(require_session)):
-        if not cfg.admin_password:
+        if not cfg.admin_passwords:
             raise HTTPException(503, "admin disabled: KARAOKE_ADMIN_PASSWORD is not set")
-        if not hmac.compare_digest(password.encode(), cfg.admin_password.encode()):
+        # Compare against every password (no short-circuit), so the response
+        # time doesn't hint at which one was close.
+        matches = [hmac.compare_digest(password.encode(), p.encode()) for p in cfg.admin_passwords]
+        if not any(matches):
             await asyncio.sleep(1)  # slows down brute-force attempts
             raise HTTPException(403, "wrong password")
         db.set_admin(k.conn, session["id"])
@@ -408,6 +519,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         k.set_paused((not k.paused) if paused is None else paused in ("1", "true", "on"))
         await k.changed()
         return {"ok": True, "paused": k.paused}
+
+    @app.post("/admin/qr")
+    async def admin_qr(pinned: str | None = Form(None), _=Depends(require_admin)):
+        k.set_qr_pinned((not k.qr_pinned) if pinned is None else pinned in ("1", "true", "on"))
+        await k.changed()
+        return {"ok": True, "qr_pinned": k.qr_pinned}
 
     @app.post("/admin/reorder")
     async def admin_reorder(
@@ -470,13 +587,17 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             await ws.send_json(k.state_message())
             while True:
                 raw = await ws.receive_text()
+                if ws.client is None or ws.client.host not in cfg.screen_hosts:
+                    continue
                 try:
                     msg = json.loads(raw)
                     kind = msg.get("type")
+                    if kind == "toggle-qr":  # the Q key on the karaoke machine
+                        k.set_qr_pinned(not k.qr_pinned)
+                        await k.changed()
+                        continue
                     item_id = int(msg["id"])
                 except (ValueError, KeyError, TypeError, AttributeError):
-                    continue
-                if ws.client is None or ws.client.host not in cfg.screen_hosts:
                     continue
                 current = k.queue.current()
                 if current is None or current["id"] != item_id:

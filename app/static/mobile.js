@@ -137,19 +137,29 @@
   function renderFailed() {
     const mine = state.failed.filter((f) => IS_ADMIN || f.owner === ME);
     $("failed").innerHTML = mine.map((f) => `
-      <div class="rounded-2xl bg-red-950/60 border border-red-900 p-3 flex items-center gap-3">
-        <div class="min-w-0 flex-1">
-          <p class="text-sm text-red-300">Couldn't play ${f.owner === ME ? "your song" : escapeHtml(f.requested_by) + "'s song"}:</p>
-          <p class="font-semibold leading-snug line-clamp-2">${escapeHtml(f.title)}</p>
-          <p class="text-xs text-red-300/80 break-words">${escapeHtml(f.error || "")}</p>
+      <div class="rounded-2xl bg-red-950/60 border border-red-900 p-3">
+        <div class="flex items-center gap-3">
+          <div class="min-w-0 flex-1">
+            <p class="text-sm text-red-300">Couldn't play ${f.owner === ME ? "your song" : escapeHtml(f.requested_by) + "'s song"}:</p>
+            <p class="font-semibold leading-snug line-clamp-2">${escapeHtml(f.title)}</p>
+            <p class="text-sm text-red-200/90 break-words">${escapeHtml(f.error || "")}</p>
+          </div>
+          ${removeButton(f, "OK")}
         </div>
-        ${removeButton(f, "OK")}
+        ${f.owner === ME ? `<button data-retry="${f.id}"
+            class="mt-2 w-full rounded-xl bg-fuchsia-600 active:bg-fuchsia-700 py-2.5 font-bold">Try another version</button>` : ""}
       </div>`).join("");
   }
 
   function renderAdmin() {
     const btn = $("btn-pause");
     if (btn) btn.textContent = state.paused ? "▶ Resume" : "⏸ Pause";
+    const qr = $("btn-qr");
+    if (qr) {
+      qr.textContent = state.qr_pinned ? "📌 QR pinned on screen · tap to unpin" : "📌 Pin QR on screen";
+      qr.classList.toggle("ring-2", !!state.qr_pinned);
+      qr.classList.toggle("ring-amber-400", !!state.qr_pinned);
+    }
   }
 
   function render() {
@@ -189,9 +199,53 @@
     },
   );
 
+  // --- search mode and "try another version" ---
+
+  const form = $("search");
+  const MODE_KEY = "karaoke.mode";
+
+  function setMode(mode, remember) {
+    const radio = form.querySelector(`input[name="mode"][value="${CSS.escape(mode || "")}"]`);
+    if (!radio) return;
+    radio.checked = true;
+    if (remember) try { sessionStorage.setItem(MODE_KEY, mode); } catch {}
+  }
+
+  try { setMode(sessionStorage.getItem(MODE_KEY)); } catch {}
+
+  function search() {
+    if (form.q.value.trim()) htmx.trigger(form, "submit");
+  }
+
+  form.addEventListener("change", (e) => {
+    if (e.target.name !== "mode") return;
+    setMode(e.target.value, true);
+    search();
+  });
+
+  // Typing a new query forgets which result had failed.
+  form.q.addEventListener("input", () => { form.failed.value = ""; });
+
+  function retry(item) {
+    form.q.value = item.query || item.title;
+    if (item.search_mode) setMode(item.search_mode, true);
+    form.failed.value = item.video_id;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    search();
+    // The notice has done its job; it goes away like tapping "OK".
+    request("DELETE", "/queue/" + item.id);
+  }
+
   // --- actions ---
 
   document.addEventListener("click", async (e) => {
+    const again = e.target.closest("[data-retry]");
+    if (again) {
+      const item = state && state.failed.find((f) => String(f.id) === again.dataset.retry);
+      if (item) retry(item);
+      return;
+    }
+
     const rm = e.target.closest("[data-remove]");
     if (rm) {
       rm.disabled = true;
@@ -214,6 +268,9 @@
       case "pause":
         await request("POST", "/admin/pause", { paused: state && state.paused ? "0" : "1" });
         break;
+      case "qr":
+        await request("POST", "/admin/qr", { pinned: state && state.qr_pinned ? "0" : "1" });
+        break;
       case "clear":
         if (confirm("Clear the whole queue? The current song keeps playing.")) {
           await request("POST", "/admin/clear");
@@ -227,6 +284,36 @@
         break;
       }
     }
+  });
+
+  // --- change your name ---
+
+  const rename = $("rename");
+  const nameText = $("my-name-text");
+
+  function toggleRename(open) {
+    rename.hidden = !open;
+    if (open) {
+      rename.name.value = nameText.textContent;
+      rename.name.focus();
+      rename.name.select();
+    }
+  }
+
+  $("my-name").addEventListener("click", () => toggleRename(rename.hidden));
+  rename.querySelector("[data-rename-cancel]").addEventListener("click", () => toggleRename(false));
+
+  rename.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = rename.querySelector("button");
+    btn.disabled = true;
+    const resp = await request("POST", "/session/name", { name: rename.name.value });
+    btn.disabled = false;
+    if (!resp) return;
+    const { name } = await resp.json();
+    nameText.textContent = name;
+    toggleRename(false);
+    toast("You're now " + name);
   });
 
   const login = $("admin-login");

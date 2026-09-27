@@ -12,7 +12,10 @@ is in [SPEC.md](SPEC.md).
 Videos are downloaded with yt-dlp into `KARAOKE_MEDIA_DIR` (on coatl,
 `/mnt/media/karaoke`, the big disk) and stay there: that's the library.
 Repeated songs start instantly and without internet.
-**They are never deleted automatically.**
+The folder has a size limit, `KARAOKE_MEDIA_MAX_GB` (150 GB by default). Past
+it, the videos requested or played least recently are deleted, so popular songs
+stay and one-offs eventually leave. Songs in the current queue are never
+deleted, and a deleted song is just downloaded again if someone asks for it.
 
 ---
 
@@ -69,6 +72,8 @@ show up in `halp`):
 alias karaoke='~/karaoke/deploy/kiosk.sh'
 # karaoke-off: closes the karaoke screen
 alias karaoke-off='~/karaoke/deploy/kiosk.sh stop'
+# karaoke-resume: reopens the karaoke screen keeping the queue
+alias karaoke-resume='~/karaoke/deploy/kiosk.sh resume'
 ```
 
 ---
@@ -76,15 +81,32 @@ alias karaoke-off='~/karaoke/deploy/kiosk.sh stop'
 ## At the party
 
 1. `escritorio` (if the graphical session isn't up).
-2. `karaoke`: turns off the screensaver and opens the full-screen view.
+2. `karaoke`: starts a new party. It empties whatever was left in the queue
+   from last time (including a song that was playing), turns off the
+   screensaver and opens the full-screen view on the QR codes. Guests' names
+   and the downloaded library stay. If you closed the screen mid-party, reopen
+   it with **Ctrl+Alt+K** or `karaoke-resume`, which keep the queue.
 3. Guests scan both QR codes: WiFi, then the app. They enter their name once
    and can then search and queue songs.
 4. At the end, `karaoke-off`.
 
+### Pinned QR code
+
+While a song plays, the app's QR code normally only shows up with the top bar
+(at the start and end of each song, and when the queue changes). To keep it
+always visible in the top-left corner, so nobody who lost the page is stuck,
+pin it:
+
+- from the admin panel on the phone: **📌 Pin QR on screen** (tap again to unpin), or
+- with the **Q** key on the karaoke machine's keyboard (press again to unpin).
+
+The screen briefly confirms the change. The setting survives restarts and new
+parties; unpinned, everything works as before.
+
 ### Exiting from the machine itself
 
 **Ctrl+Alt+K** closes the karaoke screen and brings the desktop back; pressing
-it again reopens it. It's an XFCE keyboard shortcut that runs
+it again reopens it, keeping the queue. It's an XFCE keyboard shortcut that runs
 `deploy/kiosk.sh toggle`, so it works even while Chromium is full screen. To
 set it up on a new machine (with the graphical session running):
 
@@ -98,9 +120,11 @@ Or in Settings → Keyboard → Application Shortcuts.
 ### Admin mode
 
 On the phone, the discreet **admin** link at the bottom asks for the
-`KARAOKE_ADMIN_PASSWORD` password. It gives you: skip, pause/resume, volume
-±5, move songs up/down, remove any song and clear the queue. The server checks
-permission on every request. If `KARAOKE_ADMIN_PASSWORD` is empty, admin mode
+`KARAOKE_ADMIN_PASSWORD` password (or the optional second one,
+`KARAOKE_ADMIN_PASSWORD_2`; either works). It gives you: skip, pause/resume, volume
+±5, move songs up/down, remove any song, clear the queue and pin the QR code
+on the screen (see below). The server checks
+permission on every request. If both are empty, admin mode
 is disabled.
 
 The volume is the system's (`pactl set-sink-volume @DEFAULT_SINK@`), so it
@@ -154,15 +178,27 @@ XFCE's power manager can turn it back on. If that happens: Settings → Power
 Manager → Display, and disable blanking while the karaoke is on.
 
 **All downloads start failing.** It's almost always YouTube changing
-something. Updating yt-dlp usually fixes it:
+something. Updating yt-dlp usually fixes it (yt-dlp isn't pinned in
+`requirements.txt` for this reason):
 
 ```bash
-.venv/bin/pip install -U yt-dlp && sudo systemctl restart karaoke
+scripts/update-ytdlp.sh           # updates it in .venv and restarts the service if it changed
 ```
 
-If the error mentions a JavaScript runtime, install `deno`. The failure reason
-shows up on the phone of whoever requested the song and in
-`journalctl -u karaoke`.
+The phone of whoever requested the song shows a short reason (bot
+check, video unavailable, blocked in this country, no connection, or no
+playable format) plus a **Try another version** button that goes back to the
+search with the same query and marks the version that failed. yt-dlp's full
+error and traceback only go to `journalctl -u karaoke`. If the log mentions a
+JavaScript runtime, install `deno`.
+
+**"YouTube asked to confirm you're not a bot".** YouTube is rate-limiting
+this IP. It often clears up on its own after a while. If it doesn't, export
+the cookies of a throwaway Google account in `cookies.txt` (Netscape) format
+and point `KARAOKE_COOKIES_FILE` in `.env` at it. The file must be writable by
+`rober`, because yt-dlp saves refreshed cookies back to it. It's read on every
+download, so adding or removing it doesn't need a restart. Changing `.env`
+does (`sudo systemctl restart karaoke`).
 
 **The volume control returns error 502.** `pactl` can't find the audio: the
 service uses `XDG_RUNTIME_DIR=/run/user/1000`, which only exists while

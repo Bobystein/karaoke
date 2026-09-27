@@ -24,25 +24,47 @@
     <h1 class="text-2xl font-black tracking-tight">Karaoke</h1>
     <div class="flex items-center gap-2 text-sm text-neutral-400">
       <span id="connection" class="inline-block w-2.5 h-2.5 rounded-full bg-neutral-600" title="connection"></span>
-      <span>{{ session.name }}</span>
+      <button id="my-name" type="button" title="Change your name"
+              class="rounded-lg px-1.5 py-1 -mx-1.5 active:bg-neutral-800 text-neutral-300">
+        <span id="my-name-text">{{ session.name }}</span> <span aria-hidden="true" class="text-neutral-500">✎</span>
+      </button>
       {% if session.is_admin %}<span class="rounded bg-amber-500/20 text-amber-300 px-1.5 text-xs font-semibold">admin</span>{% endif %}
     </div>
   </header>
 
+  {# --- change your name (opened by tapping it in the header) --- #}
+  <form id="rename" hidden class="mb-3 flex gap-2">
+    <input name="name" required maxlength="40" autocomplete="nickname" value="{{ session.name }}"
+           aria-label="Your name"
+           class="min-w-0 flex-1 rounded-xl bg-neutral-900 border border-neutral-700 px-3 py-2
+                  focus:outline-none focus:border-fuchsia-500">
+    <button class="rounded-xl bg-fuchsia-600 active:bg-fuchsia-700 px-4 py-2 font-bold">Save</button>
+    <button type="button" data-rename-cancel class="rounded-xl bg-neutral-800 active:bg-neutral-700 px-3 py-2">Cancel</button>
+  </form>
+
   {# --- search --- #}
-  <form hx-get="/search" hx-target="#results" hx-indicator="#searching"
+  <form id="search" hx-get="/search" hx-target="#results" hx-indicator="#searching"
         class="sticky top-0 z-10 bg-neutral-950/95 backdrop-blur pt-2 pb-3">
     <div class="flex gap-2">
       <input type="search" name="q" required maxlength="200" enterkeyhint="search"
-             placeholder="Song or artist"
+             placeholder="Song, artist or link"
              class="min-w-0 flex-1 rounded-2xl bg-neutral-900 border border-neutral-700 px-4 py-4 text-lg
                     focus:outline-none focus:border-fuchsia-500">
       <button class="rounded-2xl bg-fuchsia-600 active:bg-fuchsia-700 px-5 text-lg font-bold">Search</button>
     </div>
-    <label class="mt-2 flex items-center gap-2 text-sm text-neutral-400 select-none">
-      <input type="checkbox" name="karaoke" value="1" checked class="w-4 h-4 accent-fuchsia-600">
-      add “karaoke” to the search
-    </label>
+    {# Search mode. mobile.js remembers the choice for the browser session. #}
+    <div class="mt-2 flex gap-2" role="radiogroup" aria-label="Search mode">
+      {% for value, label in [("karaoke", "Karaoke"), ("lyrics", "Lyrics"), ("youtube", "YouTube")] %}
+      <label class="cursor-pointer select-none rounded-full border border-neutral-700 px-3.5 py-1.5 text-sm text-neutral-300
+                    has-checked:border-fuchsia-500 has-checked:bg-fuchsia-600 has-checked:text-white
+                    has-focus-visible:ring-2 has-focus-visible:ring-fuchsia-400">
+        <input type="radio" name="mode" value="{{ value }}" class="sr-only" {% if loop.first %}checked{% endif %}>
+        {{ label }}
+      </label>
+      {% endfor %}
+    </div>
+    {# Set by "try another version": marks the result that already failed. #}
+    <input type="hidden" name="failed" value="">
   </form>
 
   <p id="searching" class="htmx-indicator text-neutral-400 py-2">Searching…</p>
@@ -59,6 +81,7 @@
       <button data-admin-action="vol-down" class="rounded-xl bg-neutral-800 active:bg-neutral-700 py-3 font-semibold">🔉 −5</button>
       <span id="volume" class="self-center text-center text-sm text-neutral-400">volume</span>
       <button data-admin-action="vol-up" class="rounded-xl bg-neutral-800 active:bg-neutral-700 py-3 font-semibold">🔊 +5</button>
+      <button data-admin-action="qr" id="btn-qr" class="col-span-3 rounded-xl bg-neutral-800 active:bg-neutral-700 py-3 font-semibold">📌 Pin QR on screen</button>
     </div>
   </section>
   {% endif %}

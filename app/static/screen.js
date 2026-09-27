@@ -15,6 +15,7 @@
   let queueSignature = "";
   let barForcedUntil = 0;
   let pendingReport = null;    // `ended`/`error` that could not be sent
+  let qrPinned = null;         // null until the first state arrives
 
   const ws = connectWS(onMessage, (up) => {
     $("connection").classList.toggle("ok", up);
@@ -50,6 +51,7 @@
   function onMessage(msg) {
     if (msg.type === "state") {
       state = msg;
+      applyPinnedQr();
       apply();
     } else if (msg.type === "progress" && state) {
       for (const item of state.queue) {
@@ -132,6 +134,33 @@
     if (state.paused && !video.paused) video.pause();
     else if (!state.paused && video.paused && !video.ended && video.getAttribute("src")) play();
   }
+
+  // --- pinned QR: admin button on the phone, or the Q key here ---
+
+  let flashTimer = null;
+  function flash(text) {
+    const el = $("flash");
+    el.textContent = text;
+    el.classList.remove("hidden");
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => el.classList.add("hidden"), 2500);
+  }
+
+  function applyPinnedQr() {
+    const pinned = !!state.qr_pinned;
+    if (qrPinned !== null && pinned !== qrPinned) {
+      flash(pinned ? "QR code pinned (Q to hide it)" : "QR code unpinned (Q to pin it)");
+    }
+    qrPinned = pinned;
+    $("playing").classList.toggle("qr-pinned", pinned);
+    // While paused, the full-screen QR codes are already there.
+    $("pinned-qr").classList.toggle("hidden", !pinned || state.paused);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.key === "q" || e.key === "Q") ws.send({ type: "toggle-qr" });
+  });
 
   // --- layers ---
 

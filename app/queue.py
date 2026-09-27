@@ -40,7 +40,7 @@ class Queue:
         rows = self.conn.execute(
             f"""
             SELECT q.id, q.video_id, q.session_id, q.requested_by, q.state,
-                   q.position, q.error, q.added_at, q.played_at,
+                   q.position, q.error, q.query, q.search_mode, q.added_at, q.played_at,
                    s.title, s.channel, s.duration_s, s.thumb_url
             FROM queue q JOIN songs s ON s.video_id = q.video_id
             WHERE {where}
@@ -90,22 +90,31 @@ class Queue:
         row = self.conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM queue").fetchone()
         return row[0]
 
-    def add(self, video_id: str, session: dict) -> dict:
+    def add(
+        self, video_id: str, session: dict, query: str | None = None, search_mode: str | None = None
+    ) -> dict:
         """Adds a request. If the song is already cached it goes straight to `ready`.
 
         The song must exist in `songs` (main.py registers it from the search
-        result with db.upsert_song before calling this).
+        result with db.upsert_song before calling this). `query` and
+        `search_mode` are the search it came from, to offer another version if
+        it fails.
         """
         with self.lock:
             if db.get_song(self.conn, video_id) is None:
                 raise NotFound(f"unknown song: {video_id}")
             state = "ready" if db.cached_file(self.conn, video_id) else "queued"
+            db.touch_song(self.conn, video_id)
             cur = self.conn.execute(
                 """
-                INSERT INTO queue (video_id, session_id, requested_by, state, position)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO queue
+                    (video_id, session_id, requested_by, state, position, query, search_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (video_id, session["id"], session["name"], state, self._next_position()),
+                (
+                    video_id, session["id"], session["name"], state, self._next_position(),
+                    query, search_mode,
+                ),
             )
             return self.get(cur.lastrowid)
 
@@ -178,7 +187,8 @@ class Queue:
             (nxt["id"],),
         )
         self.conn.execute(
-            "UPDATE songs SET play_count = play_count + 1 WHERE video_id = ?",
+            "UPDATE songs SET play_count = play_count + 1, last_used_at = datetime('now') "
+            "WHERE video_id = ?",
             (nxt["video_id"],),
         )
         return self.get(nxt["id"])
@@ -273,6 +283,16 @@ class Queue:
             self.conn.execute(
                 "UPDATE queue SET state = 'removed' "
                 "WHERE state IN ('queued','downloading','ready','failed')"
+            )
+
+    def new_party(self) -> None:
+        """Starts from zero: nothing playing, nothing queued, no failures left
+        over from last time. Sessions (guests' names) and the downloaded
+        library stay."""
+        with self.lock:
+            self.conn.execute(
+                "UPDATE queue SET state = 'removed' "
+                "WHERE state IN ('queued','downloading','ready','playing','failed')"
             )
 
     def recover(self) -> None:

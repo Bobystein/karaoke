@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS songs (
     file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
     downloaded_at TEXT,
+    last_used_at TEXT,                   -- last requested or played; the library evicts the oldest
     play_count   INTEGER NOT NULL DEFAULT 0
 );
 
@@ -98,6 +99,8 @@ CREATE TABLE IF NOT EXISTS queue (
                   CHECK (state IN ('queued','downloading','ready','playing','played','failed','removed')),
     position      INTEGER NOT NULL,       -- order in the queue, editable by the admin
     error         TEXT,
+    query         TEXT,                   -- what was searched, for "try another version"
+    search_mode   TEXT,                   -- karaoke / lyrics / youtube
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
 );
@@ -149,8 +152,18 @@ the screen goes back to waiting mode.
 ### Search
 
 `ytsearch12:<query> karaoke` with `extract_flat=True` so it's fast (it doesn't
-resolve each video, it only lists them). The word "karaoke" is added to the
-query automatically, with a checkbox in the UI to leave it out.
+resolve each video, it only lists them). Three always-visible chips under the
+search box pick the mode, remembered for the browser session:
+
+- **Karaoke** (default): appends "karaoke" to the query.
+- **Lyrics**: appends "lyrics".
+- **YouTube**: the query as typed.
+
+If the text is a YouTube link (`youtube.com/watch?v=<id>`, `youtu.be/<id>`) or a
+bare 11-character id, it isn't searched: the id is extracted and validated,
+and only `https://www.youtube.com/watch?v=<id>` built by us reaches yt-dlp,
+which resolves it as a single result ready to queue. A bare 11-character word
+that turns out not to be a video falls back to a normal search.
 
 Returns id, title, channel, duration and thumbnail. Filter out results longer
 than 15 minutes (usually compilations, not songs).
@@ -163,12 +176,29 @@ natively and the UHD 620 decodes in hardware. Something like
 If what comes down isn't playable in the browser, that's a real failure:
 report `failed`, don't swallow it.
 
+Errors are translated to a short, actionable message before being
+stored in `queue.error` (bot check, video unavailable, geo restriction, no
+connection, no playable format, or a generic fallback). The UI never shows
+yt-dlp's text or a traceback; that goes to the log. A failed request keeps the
+query and mode it came from, so the phone can offer "Try another version".
+
+If `KARAOKE_COOKIES_FILE` is set and the file exists, it's passed to yt-dlp as
+`cookiefile`.
+
 Save to `<KARAOKE_MEDIA_DIR>/<video_id>.mp4`. Before downloading, check whether it already
 exists.
 
 **The cache is the most valuable feature of the system**: after a couple of
 parties there's a library of our own, repeated songs start instantly and it
-stops depending on the internet. Never delete automatically.
+stops depending on the internet.
+
+The library has a size limit (`KARAOKE_MEDIA_MAX_GB`, 150 GB by default, 0 =
+none), enforced by `app/library.py` after each download and at startup. Past
+it, songs are deleted by `songs.last_used_at` (last requested or played),
+oldest first, until it fits. Never deleted: files of active requests (queued,
+downloading, ready, playing) and files in the folder that aren't songs in the
+database. The `songs` row stays with `file_path = NULL`, so a new request just
+downloads it again.
 
 ### Security
 
@@ -248,7 +278,8 @@ long-lived cookie is set, so it isn't asked again on return. No password.
 ### Admin mode
 
 A discreet link at the bottom, "admin". Asks for a password (environment
-variable `KARAOKE_ADMIN_PASSWORD`, never in the code or in git). When correct,
+variable `KARAOKE_ADMIN_PASSWORD`, plus an optional second one in
+`KARAOKE_ADMIN_PASSWORD_2`; either is accepted. Never in the code or in git). When correct,
 it sets `is_admin` on the session and the controls appear:
 
 - Skip to the next song.
@@ -257,6 +288,11 @@ it sets `is_admin` on the session and the controls appear:
 - Remove any song, not just your own.
 - Add songs like everyone else.
 - Clear the queue.
+- Pin the app's QR code in the screen's top-left corner while songs play
+  (`POST /admin/qr`). The **Q** key on the screen does the same, sent over the
+  WebSocket and only accepted from the karaoke machine. Stored in the
+  `settings` table, so it survives restarts; it's part of the `state` message
+  (`qr_pinned`).
 - System volume control.
 
 The admin controls are the only endpoints that check permission. Check **on
@@ -270,9 +306,12 @@ the server**, on every request, not just by hiding buttons in the UI.
 
 - `GET /` → phone view (or the name form if there's no session)
 - `POST /session` → stores the name, sets the cookie
+- `POST /session/name` → changes your name (also on your requests still in the queue)
 - `GET /screen` → TV view
-- `GET /search?q=...&karaoke=1` → search results (HTMX fragment)
-- `POST /queue` → adds `video_id` to the queue
+- `POST /party/new` → empties the queue (including what's playing) for a new
+  party; only from the karaoke machine itself
+- `GET /search?q=...&mode=karaoke|lyrics|youtube[&failed=<video_id>]` → search results (HTMX fragment)
+- `POST /queue` → adds `video_id` to the queue (plus the `q` and `mode` it was found with)
 - `DELETE /queue/{id}` → removes (your own, or any if admin)
 - `GET /media/{video_id}.mp4` → serves the file with Range support, which the
   browser needs to seek within the video
@@ -306,7 +345,9 @@ WiFi details for the QR code. `.env` is in `.gitignore`.
 
 `deploy/kiosk.sh`: turns off the screensaver and launches Chromium in kiosk
 mode pointing at `/screen`, with the autoplay flag. Meant to be called from an
-alias.
+alias. A plain launch is a new party: it first calls `POST /party/new`, so the
+screen starts on the QR codes with nothing left from last time. `resume` and
+`toggle` reopen it without touching the queue.
 
 Firewall rule, documented in the README:
 

@@ -24,4 +24,6 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.54.0
 websockets==17.1
-yt-dlp==2026.8.19
+# Not pinned on purpose: YouTube changes often and old versions stop working.
+# Update with scripts/update-ytdlp.sh.
+yt-dlp

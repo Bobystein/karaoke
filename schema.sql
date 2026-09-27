@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS songs (
     file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
     downloaded_at TEXT,
+    last_used_at TEXT,                   -- last requested or played; the library evicts the oldest
     play_count   INTEGER NOT NULL DEFAULT 0
 );
 
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS queue (
                   CHECK (state IN ('queued','downloading','ready','playing','played','failed','removed')),
     position      INTEGER NOT NULL,       -- order in the queue, editable by the admin
     error         TEXT,
+    query         TEXT,                   -- what was searched, for "try another version"
+    search_mode   TEXT,                   -- karaoke / lyrics / youtube
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
 );
@@ -37,3 +40,9 @@ CREATE INDEX IF NOT EXISTS idx_queue_state ON queue(state, position);
 -- Invariant: never two songs playing at once. The database enforces it
 -- in addition to the code.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_one_playing ON queue(state) WHERE state = 'playing';
+
+-- Screen preferences that survive restarts (e.g. the pinned QR code).
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);

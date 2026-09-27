@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # Karaoke screen: Chromium in kiosk mode on /screen.
 #
-#   kiosk.sh          turns off the screensaver and launches the screen
+#   kiosk.sh          new party: empties the queue and launches the screen
+#                     (on the QR codes), with the screensaver off
+#   kiosk.sh resume   launches the screen keeping the queue as it was
 #   kiosk.sh stop     closes it and turns the screensaver back on
-#   kiosk.sh toggle   closes it if it's open, opens it if it isn't
+#   kiosk.sh toggle   closes it if it's open, reopens it (keeping the queue) if it isn't
 #
 # Meant for the `karaoke` and `karaoke-off` aliases, and `toggle` for the
 # Ctrl+Alt+K keyboard shortcut, the way out on the machine itself (see README).
 set -euo pipefail
 
 URL="${KARAOKE_URL:-http://localhost:8004/screen}"
+# Only a plain `kiosk.sh` starts a new party. Reopening with toggle (Ctrl+Alt+K)
+# or resume is usually mid-party, after closing it by mistake.
+NEW_PARTY=1
+[[ "${1:-}" == "toggle" || "${1:-}" == "resume" ]] && NEW_PARTY=0
 export DISPLAY="${DISPLAY:-:0}"
 export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 
@@ -82,6 +88,15 @@ done
 if ! curl -fsS -o /dev/null --max-time 2 "$URL"; then
     echo "The server isn't responding at $URL. Check: systemctl status karaoke" >&2
     exit 1
+fi
+
+# --- new party: last time's queue goes away -----------------------------------
+if [[ "$NEW_PARTY" == 1 ]]; then
+    if curl -fsS -o /dev/null --max-time 5 -X POST "${URL%/screen}/party/new"; then
+        echo "New party: the queue is empty."
+    else
+        echo "Couldn't empty the queue (the screen opens anyway)." >&2
+    fi
 fi
 
 # --- screensaver off, or the screen goes black mid-party ----------------------

@@ -2,15 +2,20 @@
 <p class="rounded-2xl bg-red-950/60 border border-red-900 px-4 py-3 text-red-300">{{ error }}</p>
 {% elif not results %}
 <p class="text-neutral-500 py-2">No results{% if q %} for “{{ q }}”{% endif %}.</p>
+{% elif is_link %}
+<p class="text-sm text-neutral-400">Video from the link:</p>
 {% endif %}
 {% for r in results %}
-<article class="flex items-center gap-3 rounded-2xl bg-neutral-900 p-2">
+{% set already_failed = r.video_id == failed %}
+<article class="flex items-center gap-3 rounded-2xl bg-neutral-900 p-2 {% if already_failed %}ring-1 ring-red-800 opacity-60{% endif %}"
+         {% if already_failed %}data-failed{% endif %}>
   <img src="{{ r.thumb_url }}" alt="" loading="lazy" class="w-28 aspect-video rounded-xl object-cover bg-neutral-800 shrink-0">
   <div class="min-w-0 flex-1">
     <p class="font-semibold leading-snug line-clamp-2">{{ r.title }}</p>
     <p class="text-sm text-neutral-400 truncate">{{ r.channel or "" }}{% if r.duration_s %} · {{ r.duration_s | mmss }}{% endif %}</p>
+    {% if already_failed %}<p class="text-xs font-semibold text-red-300">This version already failed</p>{% endif %}
   </div>
-  <button hx-post="/queue" hx-vals='{{ {"video_id": r.video_id} | tojson }}' hx-swap="outerHTML"
-          class="shrink-0 rounded-xl bg-fuchsia-600 active:bg-fuchsia-700 px-4 py-3 font-bold">Add</button>
+  <button hx-post="/queue" hx-vals='{{ {"video_id": r.video_id, "q": "" if is_link else q, "mode": mode} | tojson }}' hx-swap="outerHTML"
+          class="shrink-0 rounded-xl {% if already_failed %}bg-neutral-800 active:bg-neutral-700{% else %}bg-fuchsia-600 active:bg-fuchsia-700{% endif %} px-4 py-3 font-bold">Add</button>
 </article>
 {% endfor %}
