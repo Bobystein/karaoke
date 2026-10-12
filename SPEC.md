@@ -26,14 +26,15 @@ admin's phone            ─┘                   │
                                               └─→ yt-dlp → media/
 ```
 
-Runs in `/home/rober/karaoke`, port 8004, open to the local WiFi (not only
+Runs in `/srv/karaoke`, port 8004, open to the local WiFi (not only
 Tailscale).
 
 ---
 
 ## 2. Fixed stack
 
-Python 3.14, FastAPI, Uvicorn, Jinja2, HTMX and Tailwind from a CDN,
+Python 3.14, FastAPI, Uvicorn, Jinja2, HTMX and Tailwind (their browser
+builds, copied into `app/static/vendor/` so the phones need no internet),
 `websockets` (via FastAPI), standard SQLite, `yt-dlp`, `segno` (for the QR
 codes; it's pure Python and writes SVG). pytest for tests. No ORM, no Node, no
 build step.
@@ -43,18 +44,20 @@ build step.
 ## 3. Structure
 
 ```
-~/karaoke/
+/srv/karaoke/
 ├── app/
 │   ├── main.py          # HTTP and WebSocket routes
 │   ├── queue.py         # queue state, the state machine
 │   ├── downloader.py    # yt-dlp wrapper, search and download
+│   ├── check.py         # health check of the routes to YouTube, for uptime-kuma
+│   ├── catalog.py       # the downloaded songs and their artist, for the phone
 │   ├── db.py
 │   ├── templates/
 │   │   ├── base.html
 │   │   ├── screen.html      # the TV view
 │   │   ├── mobile.html      # the phone view
 │   │   └── partials/
-│   └── static/
+│   └── static/          # our JS, and vendor/ with htmx and Tailwind
 ├── media/               # downloaded videos by default (KARAOKE_MEDIA_DIR; cache, outside git)
 ├── data/karaoke.db
 ├── schema.sql
@@ -81,6 +84,7 @@ CREATE TABLE IF NOT EXISTS songs (
     video_id     TEXT PRIMARY KEY,
     title        TEXT NOT NULL,
     channel      TEXT,
+    artist       TEXT,                   -- set by an admin; NULL = guessed from the title (app/catalog.py)
     duration_s   INTEGER,
     file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
@@ -101,6 +105,8 @@ CREATE TABLE IF NOT EXISTS queue (
     error         TEXT,
     query         TEXT,                   -- what was searched, for "try another version"
     search_mode   TEXT,                   -- karaoke / lyrics / youtube
+    attempts      INTEGER NOT NULL DEFAULT 0,  -- automatic download retries so far
+    retry_at      REAL,                   -- unix time of the next retry; NULL = not waiting for one
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
 );
@@ -117,8 +123,8 @@ depend on the session still being alive.
 
 ```
 queued ──→ downloading ──→ ready ──→ playing ──→ played
-              │
-              └──→ failed
+   ↑          │
+   └─ retry ──┴──→ failed
 ```
 
 - **queued**: just added. If the song is already cached (`songs.file_path` is
@@ -129,14 +135,49 @@ queued ──→ downloading ──→ ready ──→ playing ──→ played
 - **playing**: only ONE can be in this state at a time. An invariant the tests
   must check.
 - **played**: finished. Stays in the table as history.
-- **failed**: the download failed. The reason is stored in `error`, shown to
-  whoever requested it, and the queue moves on to the next one.
+- **failed**: the download failed for good: either for a reason that trying
+  again won't fix, or after running out of automatic retries (below). The
+  reason is stored in `error`, shown to whoever requested it, and the queue
+  moves on to the next one.
 - **removed**: removed by the admin or by whoever requested it. The row is not
   deleted.
 
-The server downloads **ahead of time**: while a song plays, it's already
-downloading the next two. That way there's never a wait between songs. At most
-two simultaneous downloads so the network isn't saturated.
+The server downloads **ahead of time**, but only as fast as it needs to:
+every download is a chance for YouTube to flag the IP. The policy
+(`download_budget()` in `app/queue.py`):
+
+- Nothing playing: download right away (someone is waiting), up to 2 at a time.
+- Playing, and fewer than 2 requests `ready` after the current one: right away
+  (we're running out of cushion), 1 at a time.
+- Otherwise: 1 at a time, and only once `KARAOKE_DOWNLOAD_INTERVAL_S` (default
+  90) seconds have passed since the previous download finished (failed ones
+  count; files that were already cached don't). A timer checks again when the
+  interval is up.
+
+Downloads also pass yt-dlp `sleep_interval` 1 to 3 s and
+`sleep_interval_requests` 1 s, to space out the requests within one
+extraction. Searches don't, since someone is waiting for them.
+
+**Automatic retries.** A download that fails for a reason that may pass goes
+back to `queued`, keeping its spot, with `attempts` + 1 and `retry_at` set to
+when it will be tried again; `error` holds a short note the phone shows
+meanwhile ("retrying at 21:50"). It isn't claimed before `retry_at`, and it
+doesn't block the songs behind it. The delays (`RETRY_DELAYS_S` in
+`app/queue.py`), by kind of failure:
+
+| Kind | Delays before each retry | Then |
+|---|---|---|
+| `bot` (YouTube's bot check, 429) | 5, 10, 15, 20 min | `failed` |
+| `offline`, `other` (a 403 on one file, a dropped connection) | 1, 5, 10 min | `failed` |
+| `unavailable`, `geo`, `format` | none | `failed` at once |
+
+**Hold after a bot check.** While YouTube is turning the IP down every other
+song would fail too, and each try counts against us. So a `bot` failure also
+stops **all** downloads for a while: 5 min the first time, then 10, 15 and 20
+(the longest) for each hold in a row; a download that gets through resets the
+count. The song that hit it is retried when the hold ends. Songs already in
+the library keep playing during a hold. The hold lives in memory
+(`Karaoke.hold_until`): a restart forgets it, but not each song's `retry_at`.
 
 **Advance rule**: when the current song ends, look for the first `ready` one by
 `position`. If the next one is still `downloading`, skip to the one that is
@@ -182,8 +223,23 @@ connection, no playable format, or a generic fallback). The UI never shows
 yt-dlp's text or a traceback; that goes to the log. A failed request keeps the
 query and mode it came from, so the phone can offer "Try another version".
 
-If `KARAOKE_COOKIES_FILE` is set and the file exists, it's passed to yt-dlp as
-`cookiefile`.
+**Routes.** A download can reach YouTube three ways, tried in this order
+(`routes()` in `app/downloader.py`):
+
+1. **direct**: the house's IP, no account. Always there, and what works
+   almost always.
+2. **cookies**: the same IP, signed in. Only if `KARAOKE_COOKIES_FILE` is set
+   and the file exists; it's passed to yt-dlp as `cookiefile`. A fallback
+   rather than the default so the account is used as little as possible.
+3. **proxy**: another IP, no account. Only if `KARAOKE_PROXY_URL` is set (on
+   coatl, the VPN's HTTP proxy at `http://127.0.0.1:8888`).
+
+The next route is tried only when the failure is `bot` or `other`, which is
+when coming from somewhere else can help; a video that is gone, geo-blocked,
+unplayable or unreachable fails the same from anywhere. If every route
+fails, the error reported is the direct route's. Every route is paced the
+same. Searches and pasted links only use the direct route. Only once all
+routes have failed do the automatic retries of section 5 come in.
 
 Save to `<KARAOKE_MEDIA_DIR>/<video_id>.mp4`. Before downloading, check whether it already
 exists.
@@ -199,6 +255,18 @@ oldest first, until it fits. Never deleted: files of active requests (queued,
 downloading, ready, playing) and files in the folder that aren't songs in the
 database. The `songs` row stays with `file_path = NULL`, so a new request just
 downloads it again.
+
+### Health check
+
+`python -m app.check` (`app/check.py`) asks YouTube for one known video
+through every configured route, the way a download does but without
+downloading it, and reports to a Push monitor in uptime-kuma
+(`KARAOKE_KUMA_PUSH_URL`): `up` with "OK: direct, cookies, proxy", or `down`
+naming the routes that failed, why, and which still work. uptime-kuma sends
+the alert, also when no report arrives at all. `deploy/karaoke-check.timer`
+runs it every 55 minutes. The cookies route is only asked once a day, or when
+the file changes (the last result is repeated in between, kept in
+`data/check.json`), so the account is used as little as possible.
 
 ### Security
 
@@ -274,6 +342,35 @@ long-lived cookie is set, so it isn't asked again on return. No password.
 3. Everyone can remove their own songs, not other people's.
 4. Live updates over the same WebSocket: if someone adds something, everyone
    sees it without reloading.
+5. **Recently played**, under the queue: the last 5 songs that played and who
+   asked for them, newest first, each with an "Again" button. A closed
+   `<details>`: it's there for whoever wants to look, not always on screen.
+   Part of the `state` message (`recent`).
+6. **Downloaded songs**, a closed `<details>` under the search: everything
+   that is on disk, to request without internet. `GET /library` sends the
+   whole list once, when the section is opened, and the phone filters and
+   groups it on its own (it has to be instant and work offline):
+   - **By artist** (the default): one collapsible group per artist, in
+     alphabetical order, with how many songs each has.
+   - **A–Z**: every song in one list, by title.
+   - A **filter** box that matches the song or the artist, ignoring accents
+     and case. While filtering, every artist with a match is open.
+   - "Add" requests the song with the same `POST /queue`; it's on disk, so it
+     goes straight to `ready`.
+
+The phone view loads nothing from the internet: htmx and Tailwind are served
+from `app/static/vendor/`. With the house offline the search fails with a
+note pointing to "Downloaded songs", and everything else keeps working.
+
+**The artist.** YouTube gives a title and a channel, and the channel is often
+whoever uploaded the karaoke track. `app/catalog.py` guesses the artist from
+the title, on every read, using the rest of the library: the official channel
+when it's named in the title; else the left side of "Artist - Song"; the
+other side when other songs show that one is the artist ("Penurias - Los
+Vaguens"); a known artist named in a title with no separators; "Other" when
+nothing fits. Spellings are merged ignoring accents and case. It gets some
+wrong, so an admin can set it by hand (`songs.artist`, the ✎ next to each
+song), and that always wins; empty goes back to the guess.
 
 ### Admin mode
 
@@ -294,6 +391,10 @@ it sets `is_admin` on the session and the controls appear:
   `settings` table, so it survives restarts; it's part of the `state` message
   (`qr_pinned`).
 - System volume control.
+- Jump 5 seconds back or forward in the song that is playing
+  (`POST /admin/seek`). The position lives in the screen's `<video>`, so the
+  server only passes a `seek` message on to it.
+- Set a song's artist in "Downloaded songs".
 
 The admin controls are the only endpoints that check permission. Check **on
 the server**, on every request, not just by hiding buttons in the UI.
@@ -313,11 +414,17 @@ the server**, on every request, not just by hiding buttons in the UI.
 - `GET /search?q=...&mode=karaoke|lyrics|youtube[&failed=<video_id>]` → search results (HTMX fragment)
 - `POST /queue` → adds `video_id` to the queue (plus the `q` and `mode` it was found with)
 - `DELETE /queue/{id}` → removes (your own, or any if admin)
+- `GET /library` → the downloaded songs as JSON (`video_id`, `title`,
+  `artist`, `duration_s`, `play_count`), sorted by title
 - `GET /media/{video_id}.mp4` → serves the file with Range support, which the
   browser needs to seek within the video
 - `POST /admin/login` → checks the password
 - `POST /admin/skip`, `/admin/pause`, `/admin/reorder`, `/admin/clear`
 - `POST /admin/volume` → calls `pactl set-sink-volume @DEFAULT_SINK@`
+- `POST /admin/seek` → `delta` seconds (−60 to 60, not 0) in the current
+  song; 409 if nothing is playing
+- `POST /admin/songs/{video_id}/artist` → sets the artist by hand (empty =
+  guess it again)
 
 ### WebSocket `/ws`
 
@@ -326,6 +433,8 @@ Messages from the server to clients:
 - `state`: full state (what's playing, the queue, and the screen mode:
   `playing` or `waiting`). Sent on connect and whenever something changes.
 - `progress`: download progress of a song.
+- `seek`: `{id, delta}`, an admin's jump within the current song. The screen
+  applies it only if `id` is the request it is playing.
 
 Messages from the screen to the server:
 
@@ -340,8 +449,11 @@ Every state change is broadcast to all connected clients.
 ## 10. Deployment
 
 `deploy/karaoke.service`: user `rober`, port 8004,
-`EnvironmentFile=/home/rober/karaoke/.env` with the admin password and the
+`EnvironmentFile=/srv/karaoke/.env` with the admin password and the
 WiFi details for the QR code. `.env` is in `.gitignore`.
+
+`deploy/karaoke-check.service` and `.timer`: the health check of section 6,
+every 55 minutes, as `rober` with the same `.env`.
 
 `deploy/kiosk.sh`: turns off the screensaver and launches Chromium in kiosk
 mode pointing at `/screen`, with the autoplay flag. Meant to be called from an
@@ -379,6 +491,13 @@ up in the help automatically):
   downloading.
 - Permissions: a normal user can't remove other people's songs or call admin
   endpoints. Test by calling the endpoint directly, not only through the UI.
+- Catalog: the artist guess on the kinds of titles YouTube really has, and
+  that only files on disk are listed.
+- The phone page references nothing outside this server.
+- Retries: a passing failure goes back to `queued` and isn't tried before
+  its time; a bot check holds every download; retries run out into `failed`.
+- Routes: direct first; cookies and proxy only after a `bot` or `other`
+  failure, never for searches.
 - Search: a query with quotes, semicolons and accents doesn't break anything.
 - WiFi QR generation with an SSID and password containing characters the
   format requires escaping.

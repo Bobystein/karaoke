@@ -11,7 +11,9 @@ is in [SPEC.md](SPEC.md).
 
 Videos are downloaded with yt-dlp into `KARAOKE_MEDIA_DIR` (on coatl,
 `/mnt/media/karaoke`, the big disk) and stay there: that's the library.
-Repeated songs start instantly and without internet.
+Repeated songs start instantly and without internet. On the phone, "Downloaded
+songs" lists the whole library by artist or A–Z, with a filter, to pick from
+it when there is no internet; "Recently played" shows the last five songs.
 The folder has a size limit, `KARAOKE_MEDIA_MAX_GB` (150 GB by default). Past
 it, the videos requested or played least recently are deleted, so popular songs
 stay and one-offs eventually leave. Songs in the current queue are never
@@ -32,7 +34,7 @@ flatpak install flathub org.chromium.Chromium   # or chromium via apt/snap; kios
 The app:
 
 ```bash
-cd ~/karaoke
+cd /srv/karaoke
 python3.14 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env && chmod 600 .env
@@ -69,11 +71,11 @@ show up in `halp`):
 
 ```bash
 # karaoke: launches the karaoke screen on the monitor
-alias karaoke='~/karaoke/deploy/kiosk.sh'
+alias karaoke='/srv/karaoke/deploy/kiosk.sh'
 # karaoke-off: closes the karaoke screen
-alias karaoke-off='~/karaoke/deploy/kiosk.sh stop'
+alias karaoke-off='/srv/karaoke/deploy/kiosk.sh stop'
 # karaoke-resume: reopens the karaoke screen keeping the queue
-alias karaoke-resume='~/karaoke/deploy/kiosk.sh resume'
+alias karaoke-resume='/srv/karaoke/deploy/kiosk.sh resume'
 ```
 
 ---
@@ -112,7 +114,7 @@ set it up on a new machine (with the graphical session running):
 
 ```bash
 xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/<Primary><Alt>k' \
-  -n -t string -s "$HOME/karaoke/deploy/kiosk.sh toggle"
+  -n -t string -s "/srv/karaoke/deploy/kiosk.sh toggle"
 ```
 
 Or in Settings → Keyboard → Application Shortcuts.
@@ -121,9 +123,10 @@ Or in Settings → Keyboard → Application Shortcuts.
 
 On the phone, the discreet **admin** link at the bottom asks for the
 `KARAOKE_ADMIN_PASSWORD` password (or the optional second one,
-`KARAOKE_ADMIN_PASSWORD_2`; either works). It gives you: skip, pause/resume, volume
-±5, move songs up/down, remove any song, clear the queue and pin the QR code
-on the screen (see below). The server checks
+`KARAOKE_ADMIN_PASSWORD_2`; either works). It gives you: skip, pause/resume,
+jump 5 seconds back or forward in the song, volume ±5, move songs up/down,
+remove any song, clear the queue, pin the QR code on the screen (see below)
+and correct a song's artist in "Downloaded songs". The server checks
 permission on every request. If both are empty, admin mode
 is disabled.
 
@@ -142,16 +145,29 @@ admin's phone            ─┘                   │
 ```
 
 - `app/queue.py`: the queue state machine
-  (`queued → downloading → ready → playing → played`, plus `failed` and `removed`).
+  (`queued → downloading → ready → playing → played`, plus `failed` and `removed`),
+  and the automatic retries of downloads that failed for a passing reason.
 - `app/downloader.py`: yt-dlp as a library. Downloads H.264 + AAC in mp4 and
-  rejects any other format before downloading it.
-- `app/main.py`: HTTP routes, WebSocket and the download orchestrator (at most
-  two at a time, always fetching the upcoming songs ahead).
+  rejects any other format before downloading it. If YouTube turns down the
+  direct download, it tries again with cookies and then through the VPN's
+  proxy, when those are configured.
+- `app/main.py`: HTTP routes, WebSocket and the download orchestrator. Every
+  download is a chance for YouTube to flag the IP, so it only hurries when
+  someone is waiting: with nothing playing, or fewer than 2 songs ready after
+  the current one, it downloads right away; otherwise it waits
+  `KARAOKE_DOWNLOAD_INTERVAL_S` (90 s) after the previous download. At most 1
+  download at a time while a song plays, 2 when nothing does. The rule is
+  `download_budget()` in `app/queue.py`.
 - The screen is just another page: state lives on the server and the screen
   only plays what it's told. Its "ended" and "failed" reports are only
   accepted from `localhost`, so a phone can't skip songs.
-- The screen doesn't depend on any CDN (it works without internet). The phone
-  view uses Tailwind and HTMX from a CDN.
+- Neither the screen nor the phone view loads anything from the internet:
+  htmx and Tailwind's browser build are in `app/static/vendor/` (htmx 2.0.4,
+  @tailwindcss/browser 4.3.3; to update them, download the new files over
+  the old ones). With the house offline, the songs already downloaded can
+  still be requested from "Downloaded songs" on the phone.
+- `app/catalog.py`: the list of downloaded songs and the artist of each one,
+  guessed from the title. An admin can correct it with the ✎ next to a song.
 
 ### Development
 
@@ -189,16 +205,60 @@ The phone of whoever requested the song shows a short reason (bot
 check, video unavailable, blocked in this country, no connection, or no
 playable format) plus a **Try another version** button that goes back to the
 search with the same query and marks the version that failed. yt-dlp's full
-error and traceback only go to `journalctl -u karaoke`. If the log mentions a
-JavaScript runtime, install `deno`.
+error and traceback only go to `journalctl -u karaoke`. yt-dlp needs a
+JavaScript runtime for YouTube: `deno` is installed in `/usr/local/bin`, where
+yt-dlp finds it on its own (nothing in the code points to it), and the
+challenge solver script comes with the `yt-dlp[default]` extra. The PO token
+plugin (`bgutil-ytdlp-pot-provider`) lives in the venv and doesn't need
+anything in the code either. If you rebuild the venv, reinstall it.
 
 **"YouTube asked to confirm you're not a bot".** YouTube is rate-limiting
-this IP. It often clears up on its own after a while. If it doesn't, export
-the cookies of a throwaway Google account in `cookies.txt` (Netscape) format
-and point `KARAOKE_COOKIES_FILE` in `.env` at it. The file must be writable by
-`rober`, because yt-dlp saves refreshed cookies back to it. It's read on every
-download, so adding or removing it doesn't need a restart. Changing `.env`
-does (`sudo systemctl restart karaoke`).
+this IP; it usually lasts under an hour. The karaoke deals with it on its
+own, in this order:
+
+1. It tries the same download with the cookies of `KARAOKE_COOKIES_FILE`, if
+   that file exists.
+2. Then through `KARAOKE_PROXY_URL`, the VPN's proxy, which goes out from a
+   different IP.
+3. If all of that fails, it stops every download for 5 minutes (10, 15 and 20
+   if it keeps happening) and puts the song back in the queue. The phone
+   shows "retrying at HH:MM". Songs already in the library keep playing.
+
+A song is only marked as failed after four retries. To see what happened:
+`journalctl -u karaoke | grep -E 'failed \(|bot check|got through'`.
+
+The cookies are those of a throwaway Google account, exported in
+`cookies.txt` (Netscape) format. The file must be writable by `rober`,
+because yt-dlp saves refreshed cookies back to it. It's read on every
+download, so adding, replacing or removing it doesn't need a restart; they
+expire, so when the log shows the `cookies` route failing too, export them
+again. Changing `.env` does need one (`sudo systemctl restart karaoke`).
+
+The proxy is gluetun's (`HTTPPROXY=on` in
+`/srv/docker/qbittorrent/docker-compose.yml`), listening only on
+`127.0.0.1:8888`. Check it with
+`curl -x http://127.0.0.1:8888 https://ipinfo.io/org`: it must not say
+TekSavvy.
+
+Other passing failures (a 403 on one file, the connection dropping) are
+retried too, after 1, 5 and 10 minutes.
+
+**A Telegram alert says a route to YouTube failed.** `karaoke-check.timer`
+tests the three routes every 55 minutes (the cookies only once a day) and
+reports to the "YouTube" monitor in uptime-kuma, which sends the alert and
+another one when it recovers. The message names the route:
+
+- `direct FAILED (bot)`: YouTube is rate-limiting the house's IP. It passes
+  on its own; meanwhile downloads go through the other routes.
+- `cookies FAILED`: the cookies expired or the account was signed out.
+  Export them again to `data/cookies.txt`; the next check picks them up.
+- `proxy FAILED (offline)`: the VPN is down. `docker ps` and
+  `docker logs gluetun`.
+- Every route failing at once is usually YouTube changing something:
+  `scripts/update-ytdlp.sh`.
+
+Run it by hand with `sudo systemctl start karaoke-check` and read the result
+with `journalctl -u karaoke-check -n 20`.
 
 **The volume control returns error 502.** `pactl` can't find the audio: the
 service uses `XDG_RUNTIME_DIR=/run/user/1000`, which only exists while

@@ -13,13 +13,13 @@ RequiresMountsFor=/mnt/media
 Type=simple
 User=rober
 Group=rober
-WorkingDirectory=/home/rober/karaoke
+WorkingDirectory=/srv/karaoke
 # Admin password and WiFi details for the QR code. Kept out of git.
-EnvironmentFile=/home/rober/karaoke/.env
+EnvironmentFile=/srv/karaoke/.env
 # So `pactl` (volume control) can find rober's session audio.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/rober/karaoke/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8004
+ExecStart=/srv/karaoke/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8004
 Restart=on-failure
 RestartSec=3
 # A half-done download can take a while to let go; on restart it goes back to the queue.

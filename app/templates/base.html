@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a0a0a">
   <title>{% block title %}Karaoke{% endblock %}</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+  {# Served from here, not from a CDN: the phones must work when the house has no internet. #}
+  <script src="{{ static_url('vendor/tailwind-browser.js') }}"></script>
+  <script src="{{ static_url('vendor/htmx.min.js') }}"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="{% block body_class %}bg-neutral-950 text-neutral-100 antialiased{% endblock %}" {% block body_attrs %}{% endblock %}>

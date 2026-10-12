@@ -1,5 +1,6 @@
 {% if error %}
 <p class="rounded-2xl bg-red-950/60 border border-red-900 px-4 py-3 text-red-300">{{ error }}</p>
+<p class="text-sm text-neutral-400">The songs already downloaded still play: open <strong>Downloaded songs</strong> below.</p>
 {% elif not results %}
 <p class="text-neutral-500 py-2">No results{% if q %} for “{{ q }}”{% endif %}.</p>
 {% elif is_link %}

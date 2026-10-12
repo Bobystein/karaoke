@@ -1,0 +1,20 @@
+# Health check of the routes to YouTube, reported to uptime-kuma (app/check.py).
+# Install with karaoke-check.timer:
+#   sudo cp deploy/karaoke-check.service deploy/karaoke-check.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now karaoke-check.timer
+[Unit]
+Description=coatl karaoke: check the routes to YouTube
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rober
+Group=rober
+WorkingDirectory=/srv/karaoke
+# The routes (cookies, proxy) and KARAOKE_KUMA_PUSH_URL. Kept out of git.
+EnvironmentFile=/srv/karaoke/.env
+ExecStart=/srv/karaoke/.venv/bin/python -m app.check
+TimeoutStartSec=300
+NoNewPrivileges=true
+PrivateTmp=true

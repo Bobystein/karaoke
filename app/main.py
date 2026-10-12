@@ -16,6 +16,7 @@ import os
 import re
 import socket
 import subprocess
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -27,8 +28,15 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app import db, downloader, library
-from app.queue import Forbidden, NotFound, Queue
+from app import catalog, db, downloader, library
+from app.queue import (
+    DEFAULT_DOWNLOAD_INTERVAL_S,
+    Forbidden,
+    NotFound,
+    Queue,
+    bot_hold,
+    retry_delay,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +46,8 @@ COOKIE = "karaoke_sid"
 COOKIE_MAX_AGE = 5 * 365 * 24 * 3600
 MAX_NAME_LEN = 40
 SEARCH_CACHE_SIZE = 500
+# How far one admin seek may jump, in seconds (the buttons use 5).
+MAX_SEEK_S = 60
 
 templates = Jinja2Templates(directory=APP_DIR / "templates")
 
@@ -51,6 +61,23 @@ def mmss(seconds: int | None) -> str:
 templates.env.filters["mmss"] = mmss
 
 
+def static_url(path: str) -> str:
+    """URL of a static file with its modification time as the version.
+
+    Without it the kiosk's Chromium can keep running an old screen.js from its
+    cache after an update (it doesn't always revalidate), so a new feature
+    silently doesn't show up. A new version = a new URL = always fetched.
+    """
+    try:
+        version = int((APP_DIR / "static" / path).stat().st_mtime)
+    except OSError:
+        version = 0
+    return f"/static/{path}?v={version}"
+
+
+templates.env.globals["static_url"] = static_url
+
+
 # --- configuration ----------------------------------------------------------
 
 @dataclass
@@ -59,6 +86,8 @@ class Config:
     media_dir: Path = downloader.DEFAULT_MEDIA_DIR
     # Size limit of the video library; the least recently used go first. 0 = no limit.
     media_max_bytes: int = library.DEFAULT_MAX_GB * library.GB
+    # Minimum gap between downloads when nobody is waiting (see queue.download_budget).
+    download_interval_s: float = DEFAULT_DOWNLOAD_INTERVAL_S
     admin_password: str = ""
     # A second, independent password (e.g. for someone else to use as admin).
     admin_password_2: str = ""
@@ -80,6 +109,9 @@ class Config:
         return cls(
             media_dir=Path(media_dir) if media_dir else downloader.DEFAULT_MEDIA_DIR,
             media_max_bytes=parse_max_gb(os.environ.get("KARAOKE_MEDIA_MAX_GB", "")),
+            download_interval_s=parse_seconds(
+                os.environ.get("KARAOKE_DOWNLOAD_INTERVAL_S", ""), DEFAULT_DOWNLOAD_INTERVAL_S
+            ),
             admin_password=os.environ.get("KARAOKE_ADMIN_PASSWORD", ""),
             admin_password_2=os.environ.get("KARAOKE_ADMIN_PASSWORD_2", ""),
             wifi_ssid=os.environ.get("KARAOKE_WIFI_SSID", ""),
@@ -100,6 +132,21 @@ def parse_max_gb(value: str) -> int:
         log.warning("KARAOKE_MEDIA_MAX_GB=%r isn't a number of GB; using %d", value, library.DEFAULT_MAX_GB)
         return library.DEFAULT_MAX_GB * library.GB
     return int(gb * library.GB)
+
+
+def parse_seconds(value: str, default: float) -> float:
+    """A number of seconds >= 0 from the environment. Empty or invalid = `default`."""
+    value = value.strip()
+    if not value:
+        return default
+    try:
+        seconds = float(value)
+        if seconds < 0 or seconds != seconds:
+            raise ValueError
+    except ValueError:
+        log.warning("%r isn't a number of seconds; using %s", value, default)
+        return default
+    return seconds
 
 
 # --- QR ---------------------------------------------------------------------
@@ -160,6 +207,15 @@ class Karaoke:
         self.paused_id: int | None = None
         self.search_cache: OrderedDict[str, dict] = OrderedDict()
         self.tasks: set[asyncio.Task] = set()
+        # When the last download that went to YouTube finished (monotonic
+        # clock), and the timer that retries once the interval has passed.
+        self.last_download_done: float | None = None
+        self.download_timer: asyncio.TimerHandle | None = None
+        # YouTube's bot check: no downloads start until `hold_until` (unix
+        # time). `bot_strikes` counts the holds in a row, to make each one
+        # longer; a download that gets through resets it.
+        self.hold_until: float = 0.0
+        self.bot_strikes: int = 0
         self.lan_ip = "127.0.0.1"
         self.app_url = ""
         self.wifi_qr: str | None = None
@@ -195,6 +251,8 @@ class Karaoke:
         db.set_setting(self.conn, "qr_pinned", "1" if pinned else "0")
 
     def stop(self) -> None:
+        if self.download_timer is not None:
+            self.download_timer.cancel()
         for t in self.tasks:
             t.cancel()
         if self.conn is not None:
@@ -230,6 +288,7 @@ class Karaoke:
             "up_next": [public(i) for i in snap["up_next"]],
             "next_ready": public(snap["next_ready"]),
             "failed": [public(i) for i in snap["failed"]],
+            "recent": [public(i) for i in snap["recent"]],
             "paused": self.paused,
             "qr_pinned": self.qr_pinned,
         }
@@ -244,6 +303,9 @@ class Karaoke:
                 self.clients.discard(ws)
 
     async def changed(self) -> None:
+        # Start what's ready first, so the download policy sees whether a song
+        # is really playing; then again, for anything the pump found cached.
+        self.queue.start_if_idle()
         self.pump()
         self.queue.start_if_idle()
         await self.broadcast(self.state_message())
@@ -251,9 +313,29 @@ class Karaoke:
     # --- downloads ---
 
     def pump(self) -> None:
-        for vid in self.queue.claim_downloads():
+        """Starts the downloads the policy allows now; if time is all that stops
+        the next one (the interval, a retry that isn't due, the hold after a
+        bot check), checks again when it's up."""
+        since = None if self.last_download_done is None else time.monotonic() - self.last_download_done
+        interval = self.cfg.download_interval_s
+        now = time.time()
+        hold = now < self.hold_until
+        for vid in self.queue.claim_downloads(since, interval, now, hold):
             self.progress[vid] = 0.0
             self._spawn(self._download(vid))
+
+        if self.download_timer is not None:
+            self.download_timer.cancel()
+            self.download_timer = None
+        if hold:
+            waits = [self.hold_until - now]
+        else:
+            _, wait = self.queue.download_budget(since, interval, now)
+            waits = [w for w in (wait, self.queue.next_retry_wait(now)) if w is not None]
+        if waits:
+            self.download_timer = asyncio.get_running_loop().call_later(
+                min(waits), lambda: self._spawn(self.changed())
+            )
 
     async def _download(self, video_id: str) -> None:
         loop = asyncio.get_running_loop()
@@ -264,22 +346,49 @@ class Karaoke:
                 last[0] = pct
                 loop.call_soon_threadsafe(self._on_progress, video_id, pct)
 
+        went_to_youtube = True
         try:
             res = await asyncio.to_thread(
                 downloader.download, video_id, self.cfg.media_dir, on_progress
             )
         except downloader.DownloadError as e:
-            self.queue.mark_download_failed(video_id, str(e))
+            self._download_failed(video_id, e)
         except Exception:
             log.exception("download %s failed", video_id)
             self.queue.mark_download_failed(video_id, downloader.MESSAGES["other"])
         else:
             self.queue.mark_downloaded(video_id, res["file_path"])
-            if not res.get("cached"):
+            went_to_youtube = not res.get("cached")
+            if went_to_youtube:
+                self.bot_strikes = 0
                 self.trim_library()
         finally:
             self.progress.pop(video_id, None)
+            if went_to_youtube:  # failures count too: they asked YouTube as well
+                self.last_download_done = time.monotonic()
         await self.changed()
+
+    def _download_failed(self, video_id: str, e: downloader.DownloadError) -> None:
+        """What may work later goes back to the queue to be retried; the rest is failed for good."""
+        delay = retry_delay(e.kind, self.queue.download_attempts(video_id))
+        if delay is None:
+            self.queue.mark_download_failed(video_id, str(e))
+            return
+        now = time.time()
+        if e.kind == "bot":
+            # One hold per block: with two downloads running, the second to
+            # fail joins the hold the first one started.
+            if now >= self.hold_until:
+                self.hold_until = now + bot_hold(self.bot_strikes)
+                self.bot_strikes += 1
+                log.warning(
+                    "YouTube's bot check (%d in a row): no downloads for %d s",
+                    self.bot_strikes, self.hold_until - now,
+                )
+            retry_at = self.hold_until
+        else:
+            retry_at = now + delay
+        self.queue.retry_download(video_id, downloader.RETRY_MESSAGES[e.kind], retry_at)
 
     def _on_progress(self, video_id: str, pct: float) -> None:
         if video_id not in self.progress:
@@ -482,6 +591,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         await k.changed()
         return Response(status_code=200)
 
+    @app.get("/library")
+    async def library_songs(_=Depends(require_session)):
+        """The downloaded songs, for the phone's "Downloaded songs". Needs no
+        internet: they are requested with POST /queue like a search result."""
+        with k.queue.lock:
+            return {"songs": catalog.downloaded(k.conn)}
+
     @app.get("/media/{video_id}.mp4")
     async def media(video_id: str):
         if not downloader.is_valid_video_id(video_id):
@@ -513,6 +629,28 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             k.queue.advance(expected_id=current["id"])
         await k.changed()
         return {"ok": True}
+
+    @app.post("/admin/seek")
+    async def admin_seek(delta: int = Form(...), _=Depends(require_admin)):
+        """Jumps back or forward in the song that is playing. The position
+        lives in the screen's video, so the server only passes it on."""
+        if delta == 0 or not -MAX_SEEK_S <= delta <= MAX_SEEK_S:
+            raise HTTPException(400, f"delta must be between -{MAX_SEEK_S} and {MAX_SEEK_S}")
+        current = k.queue.current()
+        if current is None:
+            raise HTTPException(409, "nothing is playing")
+        await k.broadcast({"type": "seek", "id": current["id"], "delta": delta})
+        return {"ok": True, "delta": delta}
+
+    @app.post("/admin/songs/{video_id}/artist")
+    async def admin_set_artist(video_id: str, artist: str = Form(""), _=Depends(require_admin)):
+        """Sets a song's artist by hand; empty goes back to the guess."""
+        if not downloader.is_valid_video_id(video_id):
+            raise HTTPException(404, "unknown song")
+        with k.queue.lock:
+            if not catalog.set_artist(k.conn, video_id, artist):
+                raise HTTPException(404, "unknown song")
+        return {"ok": True, "artist": catalog.clean_artist(artist) or None}
 
     @app.post("/admin/pause")
     async def admin_pause(paused: str | None = Form(None), _=Depends(require_admin)):

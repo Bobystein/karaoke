@@ -46,10 +46,24 @@ BASE_OPTS = {
     "noplaylist": True,
 }
 
+# Downloads only: spaces out yt-dlp's requests so a download doesn't look like
+# a burst. 1 to 3 s (random) before each file, 1 s between extraction requests.
+# Searches don't get it: someone is looking at the phone waiting for them.
+DOWNLOAD_PACING = {
+    "sleep_interval": 1,
+    "max_sleep_interval": 3,
+    "sleep_interval_requests": 1,
+}
+
 
 class DownloadError(Exception):
     """The download failed. The message is stored in queue.error and shown to the user,
-    so it is always one of the readable messages from `explain()`, never yt-dlp's text."""
+    so it is always one of the readable messages from `explain()`, never yt-dlp's text.
+    `kind` is the one from `error_kind()`: main.py uses it to decide whether to retry."""
+
+    def __init__(self, message: str, kind: str = "other"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def is_valid_video_id(video_id: str) -> bool:
@@ -57,19 +71,41 @@ def is_valid_video_id(video_id: str) -> bool:
 
 
 def ydl_opts(**extra) -> dict:
-    """BASE_OPTS plus the cookie file, if KARAOKE_COOKIES_FILE points to one that exists.
+    return {**BASE_OPTS, **extra}
 
-    Read on every call, so dropping in or removing the file needs no restart.
-    yt-dlp writes refreshed cookies back to it, so it must be writable.
+
+# Kinds of failure where another route may get through: YouTube turned this
+# IP down, or failed in a way we don't recognize. The rest (video gone, geo,
+# no playable format, no internet) would fail the same way from anywhere.
+OTHER_ROUTE_KINDS = {"bot", "other"}
+
+
+def routes() -> list[tuple[str, dict]]:
+    """The ways a download can reach YouTube, in the order they are tried.
+
+    - direct: the house's IP, no account. Always there, and the only one
+      searches use.
+    - cookies: the same IP, signed in. Only if KARAOKE_COOKIES_FILE points to
+      a file that exists. yt-dlp writes refreshed cookies back to it, so it
+      must be writable. Kept as a fallback so the account is used as little
+      as possible.
+    - proxy: another IP (the VPN's HTTP proxy), no account. Only if
+      KARAOKE_PROXY_URL is set.
+
+    Read on every call, so dropping in or removing the cookie file needs no
+    restart.
     """
-    opts = {**BASE_OPTS, **extra}
+    found: list[tuple[str, dict]] = [("direct", {})]
     cookies = os.environ.get("KARAOKE_COOKIES_FILE", "").strip()
     if cookies:
         if Path(cookies).is_file():
-            opts["cookiefile"] = cookies
+            found.append(("cookies", {"cookiefile": cookies}))
         else:
             log.warning("KARAOKE_COOKIES_FILE=%s does not exist; continuing without cookies", cookies)
-    return opts
+    proxy = os.environ.get("KARAOKE_PROXY_URL", "").strip()
+    if proxy:
+        found.append(("proxy", {"proxy": proxy}))
+    return found
 
 
 # --- errors -----------------------------------------------------------------
@@ -126,6 +162,19 @@ MESSAGES = {kind: msg for kind, _, msg in ERRORS} | {
 }
 
 
+# Shown on the phone while a request waits for its automatic retry (see
+# queue.RETRY_DELAYS_S). When the retries run out, the message from MESSAGES
+# takes its place.
+RETRY_MESSAGES = {
+    "bot": "YouTube is limiting downloads right now. Your song keeps its spot and "
+    "will be tried again automatically.",
+    "offline": "Couldn't reach YouTube. Your song keeps its spot and will be tried "
+    "again automatically.",
+    "other": "The download failed. Your song keeps its spot and will be tried again "
+    "automatically.",
+}
+
+
 def error_kind(text: str) -> str:
     low = text.lower()
     for kind, patterns, _ in ERRORS:
@@ -144,7 +193,7 @@ def _fail(what: str, e: BaseException, fallback: str = "other") -> DownloadError
     """Logs the full error (with traceback) and returns the readable one for the UI."""
     text = _clean(e, limit=None)
     log.warning("%s: %s", what, text, exc_info=e)
-    return DownloadError(explain(text, fallback))
+    return DownloadError(explain(text, fallback), error_kind(text))
 
 
 def thumb_for(video_id: str) -> str:
@@ -301,7 +350,11 @@ def download(
 
     Returns {"file_path", "title", "channel", "duration_s", "cached"}.
     `on_progress` receives a 0-100 percentage (video and audio combined).
-    Raises DownloadError with a readable reason if anything fails.
+
+    Tries each of `routes()` in order, moving on only when the failure is one
+    another route could fix. Raises DownloadError with a readable reason if
+    none works: the reason of the first route, which is the one that says
+    what is wrong with the normal way in.
     """
     target = media_path(video_id, media_dir)
     if target.is_file():
@@ -329,25 +382,41 @@ def download(
         on_progress(round(min(pct, 1.0) * 100, 1))
 
     opts = ydl_opts(
+        **DOWNLOAD_PACING,
         format=FORMAT,
         merge_output_format="mp4",
         outtmpl=str(Path(media_dir) / "%(id)s.%(ext)s"),
         progress_hooks=[hook],
     )
     url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        with YoutubeDL(opts) as ydl:
-            # Resolve the format first without downloading, to reject it
-            # before spending bandwidth if it isn't playable.
-            info = ydl.extract_info(url, download=False)
-            check_playable(info)
-            streams["total"] = len(info.get("requested_formats") or [info])
-            info = ydl.process_ie_result(info, download=True)
-            if not target.is_file():
-                raise RuntimeError(f"yt-dlp finished but left no {target}")
-    except Exception as e:  # yt-dlp, ffmpeg, our format check or anything else
-        _cleanup_partials(video_id, media_dir)
-        raise _fail(f"download {video_id} failed", e) from e
+    first_error: DownloadError | None = None
+    info = None
+    for route, route_opts in routes():
+        streams.update(total=1, done=0)
+        try:
+            with YoutubeDL({**opts, **route_opts}) as ydl:
+                # Resolve the format first without downloading, to reject it
+                # before spending bandwidth if it isn't playable.
+                info = ydl.extract_info(url, download=False)
+                check_playable(info)
+                streams["total"] = len(info.get("requested_formats") or [info])
+                info = ydl.process_ie_result(info, download=True)
+                if not target.is_file():
+                    raise RuntimeError(f"yt-dlp finished but left no {target}")
+        except Exception as e:  # yt-dlp, ffmpeg, our format check or anything else
+            _cleanup_partials(video_id, media_dir)
+            error = _fail(f"download {video_id} failed ({route})", e)
+            error.__cause__ = e
+            first_error = first_error or error
+            if error.kind not in OTHER_ROUTE_KINDS:
+                break
+        else:
+            if first_error is not None:
+                log.warning("download %s got through by the %s route", video_id, route)
+            first_error = None
+            break
+    if first_error is not None:
+        raise first_error
 
     return {
         "file_path": str(target),

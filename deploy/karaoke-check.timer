@@ -1,0 +1,13 @@
+# Runs the YouTube check a little more often than uptime-kuma's heartbeat
+# interval (3600 s), so a report a few seconds late doesn't look like a miss.
+# Every run is a request to YouTube: don't make it much shorter.
+[Unit]
+Description=coatl karaoke: check the routes to YouTube every 55 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=55min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

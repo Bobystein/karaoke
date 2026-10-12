@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS songs (
     video_id     TEXT PRIMARY KEY,
     title        TEXT NOT NULL,
     channel      TEXT,
+    artist       TEXT,                   -- set by an admin; NULL = guessed from the title (app/catalog.py)
     duration_s   INTEGER,
     file_path    TEXT,                   -- NULL until downloaded
     thumb_url    TEXT,
@@ -31,6 +32,8 @@ CREATE TABLE IF NOT EXISTS queue (
     error         TEXT,
     query         TEXT,                   -- what was searched, for "try another version"
     search_mode   TEXT,                   -- karaoke / lyrics / youtube
+    attempts      INTEGER NOT NULL DEFAULT 0,  -- automatic download retries so far
+    retry_at      REAL,                   -- unix time of the next retry; NULL = not waiting for one
     added_at      TEXT NOT NULL DEFAULT (datetime('now')),
     played_at     TEXT
 );

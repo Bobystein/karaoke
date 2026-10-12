@@ -15,6 +15,9 @@ class FakeYDL:
     search_result: dict = {}
     video_info: dict = {}
     raise_on_extract: Exception | None = None
+    # One entry per route tried, in order: an exception to raise, or None to
+    # let that route through. Takes precedence over raise_on_extract.
+    raise_by_route: list = []
     write_file = True
 
     def __init__(self, opts):
@@ -29,7 +32,10 @@ class FakeYDL:
 
     def extract_info(self, url, download=False, process=True):
         FakeYDL.calls.append(("extract_info", url, download))
-        if FakeYDL.raise_on_extract:
+        if FakeYDL.raise_by_route:
+            if (error := FakeYDL.raise_by_route.pop(0)) is not None:
+                raise error
+        elif FakeYDL.raise_on_extract:
             raise FakeYDL.raise_on_extract
         if url.startswith("ytsearch"):
             return FakeYDL.search_result
@@ -56,8 +62,12 @@ def fake_ydl(monkeypatch):
     FakeYDL.search_result = {"entries": []}
     FakeYDL.video_info = {}
     FakeYDL.raise_on_extract = None
+    FakeYDL.raise_by_route = []
     FakeYDL.write_file = True
     monkeypatch.setattr(downloader, "YoutubeDL", FakeYDL)
+    # Only the direct route unless a test sets up another.
+    monkeypatch.delenv("KARAOKE_COOKIES_FILE", raising=False)
+    monkeypatch.delenv("KARAOKE_PROXY_URL", raising=False)
     return FakeYDL
 
 
@@ -290,30 +300,102 @@ def test_bot_check_is_matched_across_the_full_text(fake_ydl, tmp_path):
     assert str(exc.value) == downloader.MESSAGES["bot"]
 
 
-# --- cookies ----------------------------------------------------------------
+# --- routes -----------------------------------------------------------------
 
-def test_cookies_file_used_when_it_exists(fake_ydl, tmp_path, monkeypatch):
+BOT = yt_dlp.utils.DownloadError("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+FORBIDDEN = yt_dlp.utils.DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+GONE = yt_dlp.utils.DownloadError("ERROR: [youtube] x: Video unavailable")
+OFFLINE = yt_dlp.utils.DownloadError("ERROR: Unable to download webpage: <urlopen error timed out>")
+PROXY = "http://127.0.0.1:8888"
+
+
+@pytest.fixture
+def all_routes(tmp_path, monkeypatch):
     cookies = tmp_path / "cookies.txt"
     cookies.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setenv("KARAOKE_COOKIES_FILE", str(cookies))
-    assert downloader.ydl_opts()["cookiefile"] == str(cookies)
-    fake_ydl.video_info = H264
-    downloader.download(VID, tmp_path / "media")
-    downloader.search("x")
-    downloader.resolve(VID)
-    assert len(fake_ydl.opts_seen) == 3
-    assert all(o["cookiefile"] == str(cookies) for o in fake_ydl.opts_seen)
+    monkeypatch.setenv("KARAOKE_PROXY_URL", PROXY)
+    return str(cookies)
+
+
+def route_of(opts: dict) -> str:
+    return "cookies" if "cookiefile" in opts else "proxy" if "proxy" in opts else "direct"
+
+
+def test_routes_direct_only_by_default():
+    assert downloader.routes() == [("direct", {})]
+
+
+def test_routes_order_is_direct_cookies_proxy(all_routes):
+    assert downloader.routes() == [
+        ("direct", {}),
+        ("cookies", {"cookiefile": all_routes}),
+        ("proxy", {"proxy": PROXY}),
+    ]
 
 
 @pytest.mark.parametrize("value", ["", "/nonexistent/cookies.txt"])
 def test_cookies_file_ignored_when_missing(monkeypatch, value):
     monkeypatch.setenv("KARAOKE_COOKIES_FILE", value)
-    assert "cookiefile" not in downloader.ydl_opts()
+    assert downloader.routes() == [("direct", {})]
 
 
-def test_cookies_file_unset(monkeypatch):
-    monkeypatch.delenv("KARAOKE_COOKIES_FILE", raising=False)
-    assert "cookiefile" not in downloader.ydl_opts()
+def test_download_that_works_only_uses_the_direct_route(fake_ydl, tmp_path, all_routes):
+    fake_ydl.video_info = H264
+    downloader.download(VID, tmp_path / "media")
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct"]
+
+
+def test_search_and_resolve_never_use_cookies_or_proxy(fake_ydl, all_routes):
+    fake_ydl.video_info = H264
+    downloader.search("x")
+    downloader.resolve(VID)
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct", "direct"]
+
+
+@pytest.mark.parametrize("error", [BOT, FORBIDDEN])
+def test_download_falls_back_to_cookies_then_proxy(fake_ydl, tmp_path, all_routes, error):
+    fake_ydl.video_info = H264
+    fake_ydl.raise_by_route = [error, error, None]
+    res = downloader.download(VID, tmp_path / "media")
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct", "cookies", "proxy"]
+    assert res["cached"] is False
+    assert (tmp_path / "media" / f"{VID}.mp4").is_file()
+
+
+def test_download_stops_at_the_first_route_that_works(fake_ydl, tmp_path, all_routes):
+    fake_ydl.video_info = H264
+    fake_ydl.raise_by_route = [BOT, None]
+    downloader.download(VID, tmp_path / "media")
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct", "cookies"]
+
+
+@pytest.mark.parametrize("error,kind", [(GONE, "unavailable"), (OFFLINE, "offline")])
+def test_download_does_not_try_other_routes_for_what_they_cannot_fix(
+    fake_ydl, tmp_path, all_routes, error, kind
+):
+    fake_ydl.raise_by_route = [error, None, None]
+    with pytest.raises(DownloadError) as exc:
+        downloader.download(VID, tmp_path / "media")
+    assert exc.value.kind == kind
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct"]
+
+
+def test_download_reports_the_direct_route_error_when_all_fail(fake_ydl, tmp_path, all_routes):
+    fake_ydl.raise_by_route = [BOT, FORBIDDEN, OFFLINE]
+    with pytest.raises(DownloadError) as exc:
+        downloader.download(VID, tmp_path / "media")
+    assert exc.value.kind == "bot"
+    assert str(exc.value) == downloader.MESSAGES["bot"]
+    assert [route_of(o) for o in fake_ydl.opts_seen] == ["direct", "cookies", "proxy"]
+    assert list((tmp_path / "media").iterdir()) == []
+
+
+def test_every_route_is_paced(fake_ydl, tmp_path, all_routes):
+    fake_ydl.video_info = H264
+    fake_ydl.raise_by_route = [BOT, BOT, None]
+    downloader.download(VID, tmp_path / "media")
+    assert all(o["sleep_interval_requests"] == 1 for o in fake_ydl.opts_seen)
 
 
 # --- links ------------------------------------------------------------------
@@ -407,3 +489,28 @@ def test_resolve_error_is_readable(fake_ydl):
     with pytest.raises(DownloadError) as exc:
         downloader.resolve(VID)
     assert str(exc.value) == downloader.MESSAGES["unavailable"]
+
+
+# --- pacing -----------------------------------------------------------------
+
+def test_downloads_are_paced_searches_are_not(fake_ydl, tmp_path):
+    fake_ydl.video_info = H264
+    downloader.download(VID, tmp_path)
+    downloader.search("x")
+    downloader.resolve(VID)
+    dl, srch, res = fake_ydl.opts_seen
+    assert dl["sleep_interval"] == 1 and dl["max_sleep_interval"] == 3
+    assert dl["sleep_interval_requests"] == 1
+    for opts in (srch, res):
+        assert not {"sleep_interval", "max_sleep_interval", "sleep_interval_requests"} & opts.keys()
+
+
+def test_no_js_runtime_or_deno_path_in_options(fake_ydl, tmp_path):
+    """deno is in /usr/local/bin and yt-dlp finds it by itself."""
+    fake_ydl.video_info = H264
+    downloader.download(VID, tmp_path)
+    downloader.search("x")
+    for opts in fake_ydl.opts_seen:
+        assert "js_runtimes" not in opts
+        # (outtmpl is pytest's tmp path, which contains this test's name)
+        assert not any("deno" in repr(v) for k, v in opts.items() if k != "outtmpl")

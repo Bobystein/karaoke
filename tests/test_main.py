@@ -17,6 +17,17 @@ VID_B = "bbbbbbbbbbb"
 VID_NEW = "nnnnnnnnnnn"
 
 
+@pytest.fixture(autouse=True)
+def no_youtube(monkeypatch):
+    """No test downloads for real: by default a download fails right away,
+    with a kind that isn't retried. Tests that need a download replace it
+    with their own fake."""
+    def gone(*a, **kw):
+        raise downloader.DownloadError(downloader.MESSAGES["unavailable"], "unavailable")
+
+    monkeypatch.setattr(downloader, "download", gone)
+
+
 @pytest.fixture
 def cfg(tmp_path):
     return Config(
@@ -268,7 +279,7 @@ def test_download_failure_marks_failed_and_keeps_going(client, k, ana, monkeypat
                          "duration_s": None, "thumb_url": None}])
 
     def bad(*a):
-        raise downloader.DownloadError(downloader.MESSAGES["format"])
+        raise downloader.DownloadError(downloader.MESSAGES["format"], "format")
 
     monkeypatch.setattr(downloader, "download", bad)
     r = client.post("/queue", data={"video_id": VID_NEW, "q": "  cielito   lindo ", "mode": "lyrics"},
@@ -358,6 +369,205 @@ def test_download_over_the_limit_evicts_least_recently_used(client, k, ana, monk
     assert db.cached_file(k.conn, VID_B) and db.cached_file(k.conn, VID_NEW)
 
 
+def test_waiting_download_starts_when_the_interval_is_up(client, k, ana, monkeypatch):
+    """With a song playing and 2 ready, a new request waits for the interval
+    (here 0.3 s) after the previous download, and then downloads by itself."""
+    k.cfg.download_interval_s = 0.3
+    for vid in (VID_A, VID_B, "ccccccccccc"):
+        cached(k, vid)
+        k.queue.add(vid, ana)
+    k.queue.start_if_idle()
+    started = []
+
+    def fake_download(video_id, media_dir, on_progress):
+        started.append(time.monotonic())
+        p = Path(media_dir) / f"{video_id}.mp4"
+        p.write_bytes(b"x")
+        return {"file_path": str(p), "cached": False}
+
+    monkeypatch.setattr(downloader, "download", fake_download)
+    k.remember_results([{"video_id": VID_NEW, "title": "New", "channel": None,
+                         "duration_s": None, "thumb_url": None}])
+    k.last_download_done = time.monotonic()  # a download just finished
+    t0 = time.monotonic()
+    r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
+    item_id = int(r.headers["x-queue-id"])
+    assert k.queue.get(item_id)["state"] == "queued"  # not yet
+    assert wait_for(lambda: k.queue.get(item_id)["state"] == "ready")
+    assert started[0] - t0 >= 0.25
+    assert k.last_download_done >= started[0]  # the next wait counts from here
+
+
+def test_cached_song_on_idle_screen_plays_before_the_policy_decides(client, k, ana, monkeypatch):
+    """Adding a cached song to an empty screen starts it first, so the queued
+    ones behind it get the "playing" limit (1 download), not the idle one (2)."""
+    for vid in (VID_NEW, "ooooooooooo"):
+        db.upsert_song(k.conn, vid, vid)
+        k.queue.add(vid, ana)  # queued, no changed(): nothing has started yet
+    cached(k, VID_A)
+
+    def slow(*a):  # stays "downloading" while we look
+        time.sleep(0.3)
+        raise downloader.DownloadError("x")
+
+    monkeypatch.setattr(downloader, "download", slow)
+    client.post("/queue", data={"video_id": VID_A}, headers=as_(ana))
+    assert k.queue.current()["video_id"] == VID_A
+    assert sorted(i["video_id"] for i in k.queue.pending() if i["state"] == "downloading") == [VID_NEW]
+
+
+def test_cached_result_does_not_restart_the_interval(client, k, ana, monkeypatch):
+    k.remember_results([{"video_id": VID_NEW, "title": "N", "channel": None,
+                         "duration_s": None, "thumb_url": None}])
+
+    def already_there(video_id, media_dir, on_progress):
+        p = Path(media_dir) / f"{video_id}.mp4"
+        p.write_bytes(b"x")
+        return {"file_path": str(p), "cached": True}
+
+    monkeypatch.setattr(downloader, "download", already_there)
+    r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
+    assert wait_for(lambda: k.queue.get(int(r.headers["x-queue-id"]))["state"] in ("ready", "playing"))
+    assert k.last_download_done is None
+
+
+def test_failed_download_counts_for_the_interval(client, k, ana):
+    k.remember_results([{"video_id": VID_NEW, "title": "N", "channel": None,
+                         "duration_s": None, "thumb_url": None}])
+    r = client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))  # fails (no_youtube)
+    assert wait_for(lambda: k.queue.get(int(r.headers["x-queue-id"]))["state"] == "failed")
+    assert k.last_download_done is not None
+
+
+# --- automatic retries --------------------------------------------------------
+
+def failing_with(kind, calls):
+    def fail(video_id, *a, **kw):
+        calls.append(video_id)
+        raise downloader.DownloadError(downloader.MESSAGES[kind], kind)
+    return fail
+
+
+def request_new(client, k, session, vid=VID_NEW):
+    k.remember_results([{"video_id": vid, "title": vid, "channel": None,
+                         "duration_s": None, "thumb_url": None}])
+    r = client.post("/queue", data={"video_id": vid, "q": "cielito"}, headers=as_(session))
+    return int(r.headers["x-queue-id"])
+
+
+def test_passing_failure_goes_back_to_the_queue_to_retry(client, k, ana, monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader, "download", failing_with("other", calls))
+    before = time.time()
+    item_id = request_new(client, k, ana)
+    assert wait_for(lambda: k.queue.get(item_id)["attempts"] == 1)
+    item = k.queue.get(item_id)
+    assert item["state"] == "queued"
+    assert item["error"] == downloader.RETRY_MESSAGES["other"]
+    assert before + 55 < item["retry_at"] < time.time() + 65
+    assert k.hold_until == 0  # only the bot check stops the other downloads
+    assert k.download_timer is not None  # it will come back on its own
+    queued = k.state_message()["queue"][0]
+    assert queued["retry_at"] == item["retry_at"] and queued["error"] == item["error"]
+    assert k.state_message()["failed"] == []
+    time.sleep(0.1)
+    assert calls == [VID_NEW]  # not tried again before its time
+
+
+def test_retry_runs_when_due_and_plays(client, k, ana, monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader, "download", failing_with("other", calls))
+    item_id = request_new(client, k, ana)
+    assert wait_for(lambda: k.queue.get(item_id)["attempts"] == 1)
+
+    def works(video_id, media_dir, on_progress):
+        p = Path(media_dir) / f"{video_id}.mp4"
+        p.write_bytes(b"x")
+        return {"file_path": str(p), "cached": False}
+
+    monkeypatch.setattr(downloader, "download", works)
+    k.conn.execute("UPDATE queue SET retry_at = ? WHERE id = ?", (time.time() - 1, item_id))
+    client.get("/state")  # anything that makes the server look at the queue
+    client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
+    assert wait_for(lambda: k.queue.get(item_id)["state"] == "playing")
+    item = k.queue.get(item_id)
+    assert item["error"] is None and item["retry_at"] is None
+
+
+def test_retries_run_out_and_it_fails_for_good(client, k, ana, monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader, "download", failing_with("other", calls))
+    item_id = request_new(client, k, ana)
+    assert wait_for(lambda: k.queue.get(item_id)["attempts"] == 1)
+    k.conn.execute("UPDATE queue SET attempts = 3, retry_at = 0 WHERE id = ?", (item_id,))
+    client.post("/queue", data={"video_id": VID_NEW}, headers=as_(ana))
+    assert wait_for(lambda: k.queue.get(item_id)["state"] == "failed")
+    item = k.queue.get(item_id)
+    assert item["error"] == downloader.MESSAGES["other"] and item["retry_at"] is None
+    # Still offers "try another version".
+    assert k.state_message()["failed"][0]["query"] == "cielito"
+
+
+def test_bot_check_holds_every_download(client, k, ana, beto, monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader, "download", failing_with("bot", calls))
+    before = time.time()
+    first = request_new(client, k, ana)
+    assert wait_for(lambda: k.queue.get(first)["attempts"] == 1)
+    assert before + 295 < k.hold_until < time.time() + 305
+    assert k.queue.get(first)["retry_at"] == k.hold_until
+    assert k.bot_strikes == 1
+
+    # Another song asked for during the hold doesn't go to YouTube at all.
+    second = request_new(client, k, beto, VID_B)
+    time.sleep(0.1)
+    assert calls == [VID_NEW]
+    assert k.queue.get(second)["state"] == "queued" and k.queue.get(second)["attempts"] == 0
+    assert k.download_timer is not None
+
+
+def test_cached_songs_still_play_during_a_hold(client, k, ana, monkeypatch):
+    k.hold_until = time.time() + 300
+    cached(k, VID_A)
+    monkeypatch.setattr(downloader, "download", lambda *a, **kw: pytest.fail("must not download"))
+    r = client.post("/queue", data={"video_id": VID_A}, headers=as_(ana))
+    assert wait_for(lambda: k.queue.get(int(r.headers["x-queue-id"]))["state"] == "playing")
+
+
+def test_two_downloads_failing_together_are_one_hold(client, k, ana):
+    k._download_failed(VID_A, downloader.DownloadError("x", "bot"))
+    hold = k.hold_until
+    k._download_failed(VID_B, downloader.DownloadError("x", "bot"))
+    assert k.hold_until == hold and k.bot_strikes == 1
+
+
+def test_holds_get_longer_and_a_download_that_works_resets_them(client, k, ana, monkeypatch):
+    for expected in (300, 600, 900, 1200, 1200):
+        k.hold_until = 0.0
+        now = time.time()
+        k._download_failed(VID_A, downloader.DownloadError("x", "bot"))
+        assert expected - 5 < k.hold_until - now < expected + 5
+    k.hold_until = 0.0
+
+    def works(video_id, media_dir, on_progress):
+        p = Path(media_dir) / f"{video_id}.mp4"
+        p.write_bytes(b"x")
+        return {"file_path": str(p), "cached": False}
+
+    monkeypatch.setattr(downloader, "download", works)
+    item_id = request_new(client, k, ana)
+    assert wait_for(lambda: k.queue.get(item_id)["state"] == "playing")
+    assert k.bot_strikes == 0
+
+
+def test_download_interval_from_env(monkeypatch):
+    monkeypatch.setenv("KARAOKE_DOWNLOAD_INTERVAL_S", "30")
+    assert Config.from_env().download_interval_s == 30
+    for bad in ("", "soon", "-1"):
+        monkeypatch.setenv("KARAOKE_DOWNLOAD_INTERVAL_S", bad)
+        assert Config.from_env().download_interval_s == 90
+
+
 def test_user_cannot_remove_others_song(client, k, ana, beto):
     db.upsert_song(k.conn, VID_A, "A")
     item = k.queue.add(VID_A, ana)
@@ -386,6 +596,8 @@ ADMIN_CALLS = [
     ("/admin/clear", {}),
     ("/admin/qr", {}),
     ("/admin/volume", {"level": "50"}),
+    ("/admin/seek", {"delta": "5"}),
+    (f"/admin/songs/{VID_A}/artist", {"artist": "Someone"}),
 ]
 
 
@@ -769,8 +981,24 @@ def test_screen_works_offline_and_has_no_controls(client):
     html = client.get("/screen").text
     assert "cdn." not in html and "https://" not in html  # nothing external
     assert "<video" in html and "controls" not in html.split("<video", 1)[1].split(">", 1)[0]
-    assert '/static/screen.js' in html and '/static/ws.js' in html
+    assert '/static/screen.js?v=' in html and '/static/ws.js?v=' in html
     assert client.get("/static/screen.js").status_code == 200
+
+
+def test_scripts_are_versioned_so_updates_skip_the_cache(client, ana, monkeypatch):
+    import os
+    js = main.APP_DIR / "static" / "screen.js"
+    before = client.get("/screen").text
+    assert main.static_url("screen.js") in before and "/static/screen.js?v=" in before
+    assert "/static/mobile.js?v=" in client.get("/", headers=as_(ana)).text
+    st = js.stat()
+    try:
+        os.utime(js, (st.st_atime, st.st_mtime + 60))  # "update" the file
+        assert main.static_url("screen.js") in client.get("/screen").text
+        assert main.static_url("screen.js") not in before
+    finally:
+        os.utime(js, (st.st_atime, st.st_mtime))
+    assert client.get(main.static_url("screen.js")).status_code == 200
 
 
 def test_screen_without_wifi_config(tmp_path):
@@ -788,3 +1016,86 @@ def test_media_dir_from_env(monkeypatch, tmp_path):
     assert Config.from_env().media_dir == tmp_path / "songs"
     monkeypatch.delenv("KARAOKE_MEDIA_DIR")
     assert Config.from_env().media_dir == downloader.DEFAULT_MEDIA_DIR
+
+
+# --- recently played, downloaded songs, seek ----------------------------------
+
+def test_state_has_the_recently_played(client, k, ana):
+    cached(k, VID_A)
+    cached(k, VID_B)
+    k.queue.add(VID_A, ana)
+    k.queue.add(VID_B, ana)
+    k.queue.start_if_idle()
+    assert k.state_message()["recent"] == []
+    k.queue.advance()
+    recent = k.state_message()["recent"]
+    assert [(i["video_id"], i["requested_by"]) for i in recent] == [(VID_A, "Ana")]
+    assert "session_id" not in recent[0]
+
+
+def test_library_lists_downloaded_songs_and_they_can_be_requested(client, k, ana, monkeypatch):
+    cached(k, VID_A)
+    db.upsert_song(k.conn, VID_B, "Not downloaded", "Channel", 100, None)
+    r = client.get("/library", headers=as_(ana))
+    assert r.status_code == 200
+    assert [s["video_id"] for s in r.json()["songs"]] == [VID_A]
+    assert set(r.json()["songs"][0]) == {"video_id", "title", "artist", "duration_s", "play_count"}
+    # With no internet: it never touches YouTube.
+    monkeypatch.setattr(downloader, "download", lambda *a, **kw: pytest.fail("must not download"))
+    monkeypatch.setattr(downloader, "search", lambda *a, **kw: pytest.fail("must not search"))
+    r = client.post("/queue", data={"video_id": VID_A}, headers=as_(ana))
+    assert r.status_code == 201
+    assert wait_for(lambda: (k.queue.current() or {}).get("video_id") == VID_A)
+
+
+def test_library_needs_a_session(client):
+    assert client.get("/library").status_code == 401
+
+
+def test_admin_sets_the_artist(client, k, ana, admin):
+    cached(k, VID_A)
+    r = client.post(f"/admin/songs/{VID_A}/artist", data={"artist": " Los  Vaguens "}, headers=as_(admin))
+    assert r.json() == {"ok": True, "artist": "Los Vaguens"}
+    assert client.get("/library", headers=as_(ana)).json()["songs"][0]["artist"] == "Los Vaguens"
+    assert client.post(f"/admin/songs/{VID_NEW}/artist", data={"artist": "x"}, headers=as_(admin)).status_code == 404
+    assert client.post("/admin/songs/not-an-id/artist", data={"artist": "x"}, headers=as_(admin)).status_code == 404
+
+
+def test_admin_seek_tells_the_screen(client, k, ana, admin):
+    cached(k, VID_A)
+    item = k.queue.add(VID_A, ana)
+    k.queue.start_if_idle()
+    with client.websocket_connect("/ws") as screen:
+        assert screen.receive_json()["type"] == "state"
+        for delta in (5, -5):
+            r = client.post("/admin/seek", data={"delta": str(delta)}, headers=as_(admin))
+            assert r.status_code == 200
+            assert screen.receive_json() == {"type": "seek", "id": item["id"], "delta": delta}
+
+
+@pytest.mark.parametrize("delta", ["0", "61", "-61", "soon", ""])
+def test_admin_seek_rejects_bad_deltas(client, k, ana, admin, delta):
+    cached(k, VID_A)
+    k.queue.add(VID_A, ana)
+    k.queue.start_if_idle()
+    r = client.post("/admin/seek", data={"delta": delta}, headers=as_(admin))
+    assert r.status_code in (400, 422)
+
+
+def test_admin_seek_with_nothing_playing(client, admin):
+    assert client.post("/admin/seek", data={"delta": "5"}, headers=as_(admin)).status_code == 409
+
+
+def test_phone_page_loads_nothing_from_the_internet(client, ana):
+    page = client.get("/", headers=as_(ana)).text
+    assert "https://" not in page and "http://" not in page
+    for script in ("vendor/htmx.min.js", "vendor/tailwind-browser.js"):
+        assert f"/static/{script}?v=" in page
+        assert client.get(f"/static/{script}").status_code == 200
+    assert 'id="library"' in page and 'id="recent"' in page
+
+
+def test_seek_buttons_only_for_admins(client, ana, admin):
+    assert "seek-back" not in client.get("/", headers=as_(ana)).text
+    page = client.get("/", headers=as_(admin)).text
+    assert "seek-back" in page and "seek-forward" in page

@@ -27,8 +27,14 @@ def connect(path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # touch an existing table, so they are added here, with an optional statement
 # that fills them in for the rows that already existed.
 ADDED_COLUMNS = {
-    "queue": [("query", "TEXT", None), ("search_mode", "TEXT", None)],
+    "queue": [
+        ("query", "TEXT", None),
+        ("search_mode", "TEXT", None),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0", None),
+        ("retry_at", "REAL", None),
+    ],
     "songs": [
+        ("artist", "TEXT", None),
         (
             "last_used_at",
             "TEXT",

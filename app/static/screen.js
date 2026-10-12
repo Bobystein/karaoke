@@ -53,12 +53,23 @@
       state = msg;
       applyPinnedQr();
       apply();
+    } else if (msg.type === "seek") {
+      seek(msg);
     } else if (msg.type === "progress" && state) {
       for (const item of state.queue) {
         if (item.video_id === msg.video_id) item.progress = msg.pct;
       }
       if (!state.current) renderWaiting();
     }
+  }
+
+  // An admin's −5 s / +5 s. Only for the song it was meant for: a late
+  // message must not move the next one.
+  function seek(msg) {
+    if (msg.id !== playingId || !isFinite(video.duration)) return;
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + msg.delta));
+    barForcedUntil = Date.now() + 3000;  // show where we are now
+    updateOverlays();
   }
 
   function apply() {
@@ -178,7 +189,11 @@
     }
     el.innerHTML = `<div class="heading">Downloading…</div><ul>${items.map((i) => {
       const pct = i.state === "downloading" && i.progress != null ? ` <span class="pct">${Math.round(i.progress)}%</span>` : "";
-      return `<li>${escapeHtml(i.title)} · ${escapeHtml(i.requested_by)}${pct}</li>`;
+      // Its download failed and the server will try again on its own.
+      const retry = i.state === "queued" && i.retry_at
+        ? ` <span class="pct">retrying at ${new Date(i.retry_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>`
+        : "";
+      return `<li>${escapeHtml(i.title)} · ${escapeHtml(i.requested_by)}${pct}${retry}</li>`;
     }).join("")}</ul>`;
   }
 

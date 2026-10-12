@@ -14,7 +14,7 @@ SERVICE=karaoke
 version() { "$PY" -c 'from yt_dlp.version import __version__; print(__version__)'; }
 
 before=$(version)
-"$PY" -m pip install --upgrade --quiet yt-dlp
+"$PY" -m pip install --upgrade --quiet "yt-dlp[default]"
 after=$(version)
 
 if [[ "$before" == "$after" ]]; then

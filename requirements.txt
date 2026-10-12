@@ -25,5 +25,7 @@ typing_extensions==4.16.0
 uvicorn==0.54.0
 websockets==17.1
 # Not pinned on purpose: YouTube changes often and old versions stop working.
-# Update with scripts/update-ytdlp.sh.
-yt-dlp
+# Update with scripts/update-ytdlp.sh. The [default] extra brings yt-dlp-ejs,
+# the script that solves YouTube's JavaScript challenges (with deno); the
+# signed-in clients used with cookies don't work without it.
+yt-dlp[default]
